@@ -1,0 +1,232 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+
+```{r config, echo=FALSE, message=FALSE}
+renv::load("~/project/b16_davide_dev/")
+rm(list = ls())
+library(tidyverse)
+library(openxlsx)
+library(stringr)
+
+library(Seurat)
+options(Seurat.object.assay.version = "v3") # objects were created with v3
+
+library(RColorBrewer)
+library(gridExtra)
+library(cowplot)
+library(ggbeeswarm)
+library(ggsignif)
+library(ComplexHeatmap)
+library(circlize)
+
+source("../../make_figures/utils.R")
+regress_out_prolif <- FALSE
+```
+
+load data
+```{r}
+so_T <- load_sc_data("T")
+```
+
+
+
+## Identify CD8 T cells
+
+### Naive CD8 T cells.
+```{r}
+naive_t <- so_T[,so_T$annotation == "Naïve T"]
+naive_t <- FindVariableFeatures(naive_t)
+naive_t <- ScaleData(naive_t)
+naive_t <- RunPCA(naive_t)
+ElbowPlot(naive_t, 50)
+pc_dims <- 1:20
+naive_t <- RunUMAP(naive_t, reduction = "pca", dims = pc_dims)
+naive_t <- FindNeighbors(naive_t, reduction = "pca", dims = pc_dims)
+naive_t <- FindClusters(naive_t, resolution = 0.1)
+DimPlot(naive_t, label = TRUE)
+FeaturePlot(naive_t, "Cd4")
+FeaturePlot(naive_t, "Cd8a")
+```
+
+### Other CD8 T cell clusters
+```{r}
+celltype_cd8_vec <- ann_T$annotation[ann_T$contain_CD8 == "yes"]
+cluster_name_cd8_vec <- ann_T$cluster[ann_T$contain_CD8 == "yes"]
+cd8 <- so_T[,c(colnames(naive_t)[naive_t$seurat_clusters == 1], colnames(so_T)[so_T$annotation %in% setdiff(celltype_cd8_vec, "Naïve T")])]
+cd8$cluster_name <- factor(cd8$cluster_name, levels = cluster_name_cd8_vec)
+cd8$annotation <- factor(cd8$annotation, levels = celltype_cd8_vec)
+cd8@meta.data <- droplevels(cd8@meta.data)
+table(cd8$annotation)
+table(so_T$annotation)
+
+cd8 <- FindVariableFeatures(cd8)
+cd8 <- ScaleData(cd8)
+cd8 <- RunPCA(cd8)
+ElbowPlot(cd8, 50)
+```
+
+```{r}
+pc_dims <- 1:20
+cd8 <- FindNeighbors(cd8, reduction = "pca", dims = pc_dims)
+cd8 <- FindClusters(cd8, resolution = 0.5)
+table(cd8$seurat_clusters)
+
+cd8_all_markers <- FindAllMarkers(cd8)
+saveRDS(cd8_all_markers, paste0("cd8_all_markers_", Sys.Date(), ".rds"))
+
+
+cd8 <- RunUMAP(cd8, reduction = "pca", dims = pc_dims, n.neighbors = 50, min.dist = 0.5, seed.use = 1)
+DimPlot(cd8, label = TRUE, group.by = "annotation")
+DimPlot(cd8, label = TRUE, group.by = "RNA_snn_res.0.5")
+DimPlot(cd8, label = FALSE, group.by = "tumor_size")
+cd8_all_markers %>% 
+  filter(cluster == 7)
+```
+
+
+```{r}
+cd8 <- cd8[,cd8$RNA_snn_res.0.5 != 7]
+
+cd8 <- FindVariableFeatures(cd8)
+cd8 <- ScaleData(cd8)
+cd8 <- RunPCA(cd8)
+ElbowPlot(cd8, 50)
+
+```
+
+
+```{r}
+pc_dims <- 1:10
+cd8 <- RunUMAP(cd8, reduction = "pca", dims = pc_dims, min.dist = 0.5, n.neighbors = 50, seed.use = 123)
+# cd8 <- FindNeighbors(cd8, reduction = "pca", dims = pc_dims)
+# cd8 <- FindClusters(cd8, resolution = 0.5)
+# DimPlot(cd8, label = TRUE)
+# cd8@reductions$umap@cell.embeddings[,1] <- -cd8@reductions$umap@cell.embeddings[,1] # flip the first dim for more intuitive directional visualization
+DimPlot(cd8, label = TRUE, group.by = "annotation")
+# DimPlot(cd8, label = FALSE, group.by = "tumor_size")
+```
+
+
+
+Signatures
+```{r}
+wb <- loadWorkbook("../../../0_data/other/signatures_v2.xlsx")
+sig_info <- readWorkbook(wb, "info")
+sig_info$sheet_name
+
+sig_list <- list()
+
+tmp <- readWorkbook(wb, "CT26_Cluster2_Singer2016")
+tmp <- tmp %>% 
+  filter(cluster == 2, `anova_fdr_pvals.min(anova_raw_vals,anova_log2_vals)` < 0.01)
+sig_list[["Dysfunctional CD8"]] <-  rownames(so_T)[match(tmp$x %>% toupper(), rownames(so_T) %>% toupper())] %>% na.omit()
+
+
+tmp <- readWorkbook(wb, "LCMV_c13_ExhTran_d45_Hudson2019")
+sig_list[["Transitory vs. terminally exhausted"]] <- tmp$external_gene_name[which(tmp$padj < 0.05 & tmp$log2FoldChange < -log2(1.5))] %>% intersect(., rownames(so_T))
+
+tmp <- readWorkbook(wb, "Tumor_bulk_ProgExh_Miller2019")
+sig_list[["Progenitor vs. terminally exhausted (Tumor, bulk)"]] <- tmp$Gene[which(tmp$padj < 0.05 & tmp$log2FoldChange > log2(1.5))] %>% intersect(., rownames(so_T))
+sig_list[["Terminally exhausted vs. Progenitor (Tumor, bulk)"]] <- tmp$Gene[which(tmp$padj < 0.05 & tmp$log2FoldChange < -log2(1.5))] %>% intersect(., rownames(so_T))
+
+tmp <- readWorkbook(wb, "LCMV_bulk_ProgExh_Miller2019")
+sig_list[["Progenitor vs. terminally exhausted (LCMV, bulk)"]] <- tmp$Gene[which(tmp$padj < 0.05 & tmp$log2FoldChange > log2(1.5))] %>% intersect(., rownames(so_T))
+
+sig_list[["Terminally exhausted vs. Progenitor (LCMV, bulk)"]] <- tmp$Gene[which(tmp$padj < 0.05 & tmp$log2FoldChange < -log2(1.5))] %>% intersect(., rownames(so_T))
+
+tmp <- readWorkbook(wb, "LCMV_sc_ProgExh_Miller2019")
+sig_list[["Progenitor exhausted (LCMV, sc)"]] <- tmp$gene[which(tmp$`FDR-adj..p` < 0.05 & tmp$logFC > 0.25)] %>% intersect(., rownames(so_T))
+
+tmp <- readWorkbook(wb, "LCMV_sc_Effector_Miller2019")
+sig_list[["Effector-like (LCMV, sc)"]] <- tmp$gene[which(tmp$`FDR-adj..p` < 0.05 & tmp$logFC > 0.25)] %>% intersect(., rownames(so_T))
+
+tmp <- readWorkbook(wb, "LCMV_sc_TermExh_Miller2019")
+sig_list[["Terminally exhausted (LCMV, sc)"]] <- tmp$gene[which(tmp$`FDR-adj..p` < 0.05 & tmp$logFC > 0.25)] %>% intersect(., rownames(so_T))
+
+
+tmp <- readWorkbook(wb, "Short_lived_effectors_Andreatta", colNames = FALSE, rowNames = FALSE)
+sig_short <- list("Short-lived effectors signature" = tmp[,1] %>% gsub(" ", "", .) %>% intersect(., rownames(so_T)))
+
+source("~/project/utils/map_genes/map_human_mouse_genes.R")
+tmp <- read.xlsx("../../make_figures/Fig4/JaiswaletalNonResp_Resp to ICB.xlsx", startRow = 3)
+sig_jasiwall <- list(
+  Responder = human_to_mouse(tmp$CLUSTER3_UP) %>% intersect(., rownames(so_T)),
+  Non_responder = human_to_mouse(tmp$CLUSTER1_UP) %>% intersect(., rownames(so_T))
+)
+
+wb <- loadWorkbook("../../make_figures/Fig1/TRMSignatures.xlsx")
+sig_trm <- lapply(wb$sheet_names, function(x) {
+  tmp <- readWorkbook(wb, x, startRow = 3)
+  as.list(tmp) %>% lapply(., na.omit) %>% human_to_mouse()
+}) %>% unlist(recursive = FALSE)
+
+deg <- readRDS("../../penk_ko_bulk_RNAseq/deg_filt_gene_sample.rds")
+deg <- deg %>% filter(!is.na(padj))
+head(deg)
+
+penk_sig <- list(
+  Penk_KO = deg$gene[intersect(order(deg$padj), which(deg$log2FoldChange > 0))[1:200]],
+  Penk_WT = deg$gene[intersect(order(deg$padj), which(deg$log2FoldChange < 0))[1:200]]
+)
+
+sig_list <- c(sig_list, sig_short, sig_trm, sig_jasiwall, penk_sig)
+lengths(sig_list)
+```
+
+
+
+
+```{r}
+## compute signatures score
+cd8@meta.data <- cd8@meta.data[, setdiff(colnames(cd8@meta.data), names(sig_list))]
+cd8 <- AddModuleScore(cd8, features = sig_list, name = "SIG")
+colnames(cd8@meta.data)[grep("^SIG", colnames(cd8@meta.data))] <- names(sig_list)
+```
+
+
+```{r}
+saveRDS(cd8, "cd8.rds")
+```
+
+## Trajectory by Slingshot
+```{r}
+library(slingshot)
+sce <- as.SingleCellExperiment(cd8)
+sce <- slingshot(sce, clusterLabels = 'annotation', reducedDim = 'PCA')
+
+saveRDS(sce, "cd8_slingshot_sce.rds")
+saveRDS(SlingshotDataSet(sce)@lineages, "slingshot_lineages.rds")
+
+plt_df <- data.frame(UMAP_1 = cd8@reductions$umap@cell.embeddings[,1],
+                     UMAP_2 = cd8@reductions$umap@cell.embeddings[,2],
+                     pseudotime_1 = sce$slingPseudotime_1,
+                     pseudotime_2 = sce$slingPseudotime_2)
+
+p_pt_1 <- ggplot(plt_df[order(plt_df$pseudotime_1, na.last = FALSE),], aes(x = UMAP_1, y = UMAP_2, color = pseudotime_1)) +
+  geom_point(size = 0.5) +
+  coord_fixed() +
+  scale_color_gradientn(colors = brewer.pal(11,'Spectral')[-6]) +
+  labs(color = "Pseudotime 1") +
+  theme_classic() +
+  theme(axis.text = element_blank(),
+        axis.ticks = element_blank(),
+        panel.background = element_blank(),
+        panel.border = element_rect(color = "black", fill = NA))
+p_pt_2 <- ggplot(plt_df[order(plt_df$pseudotime_2, na.last = FALSE),], aes(x = UMAP_1, y = UMAP_2, color = pseudotime_2)) +
+  geom_point(size = 0.5) +
+  coord_fixed() +
+  scale_color_gradientn(colors = brewer.pal(11,'Spectral')[-6]) +
+  labs(color = "Pseudotime 2") +
+  theme_classic() +
+  theme(axis.text = element_blank(),
+        axis.ticks = element_blank(),
+        panel.background = element_blank(),
+        panel.border = element_rect(color = "black", fill = NA))
+p_pt_1
+p_pt_2
+```
+
+

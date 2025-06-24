@@ -1,0 +1,249 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+```{r}
+rm(list = ls())
+
+library(Seurat)
+library(tidyverse)
+library(openxlsx)
+library(ggbeeswarm)
+library(ggsignif)
+library(ggrepel)
+library(grid)
+library(gridExtra)
+source("utils.R")
+```
+
+
+## Table S4. Penk KO vs. WT DE genes.
+```{r}
+de_res <- readRDS("../../penk_ko_bulk_RNAseq/deg_filt_gene_sample.rds")
+de_res <- de_res %>% 
+  mutate(higher_ko = log2FoldChange > 0) %>% 
+  group_by(higher_ko) %>% 
+  mutate(rank_padj = rank(padj)) %>% 
+  ungroup() %>% 
+  mutate(direction_top_200_padj = ifelse(rank_padj > 200, NA,
+                                         ifelse(higher_ko, "KO", "WT"))) %>% 
+  select(gene, baseMean, log2FoldChange, lfcSE, stat, pvalue, padj, direction_top_200_padj) %>% 
+  arrange(padj)
+
+write.xlsx(de_res, paste0("TableS4_Penk_KO_vs_WT_differential_genes_", Sys.Date(), ".xlsx"))
+```
+
+
+
+## 4A. Volcano plot of top DE genes.
+```{r}
+genes_to_highlight <- read.csv("Penk_DEG_to_highlight.csv", header = FALSE)[,1]
+plt_df <- de_res %>% 
+  filter(!is.na(padj)) %>% 
+  mutate(gene_label = ifelse(gene %in% genes_to_highlight, gene, NA),
+         direction_top_200_padj = ifelse(is.na(direction_top_200_padj), "NS", direction_top_200_padj) %>% factor(levels = c("WT", "KO", "NS"))) %>% 
+  arrange(-padj)
+
+library(ggrepel)
+p <- ggplot(plt_df, aes(x = log2FoldChange, y = -log10(pvalue), color = direction_top_200_padj)) +
+  geom_vline(xintercept = 0, color = "grey") +
+  geom_point() +
+  geom_label_repel(aes(label = gene_label), color = "black", fill = alpha("white", 0.5), min.segment.length = 0, max.overlaps = Inf, label.padding = 0.05, label.size = NA) +
+  scale_color_manual(values = c("KO" = "salmon", "WT" = "steelblue", "NS" = "grey90")) +
+  labs(color = "Upregulated in") +
+  xlim(-8.1, 8.1) +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.05))) +
+  theme_classic()
+
+pdf(paste0("4A_volcano_Penk_KO_vs_WT_", Sys.Date(), ".pdf"), width = 8, height = 5)
+p
+dev.off()
+
+```
+
+
+## 4B. UMAP Penk signatures.
+```{r}
+sigs_to_plot <- c("Penk_WT" = "Penk WT", 
+                  "Penk_KO" = "Penk KO")
+cd8_cluster_vec <- c("T3", "T0", "T1", "T7", "T4", "T9")
+color_cluster_annotation_cd8 <- color_cluster_annotation_T[match(cd8_cluster_vec, names(color_cluster_T))]
+cd8$cluster_annotation <- factor(cd8$cluster_annotation, levels = names(color_cluster_annotation_cd8))
+
+plist_umap <- list()
+plist_vln <- list()
+for (x in names(sigs_to_plot)) {
+  plt_df <- data.frame(UMAP_1 = cd8@reductions$umap@cell.embeddings[,1],
+                       UMAP_2 = cd8@reductions$umap@cell.embeddings[,2],
+                       sigscore = cd8@meta.data[,x],
+                       cluster_name = cd8$cluster_name %>% factor(levels = cd8_cluster_vec), 
+                       annotation = cd8$annotation) %>% 
+    mutate(sigscore_cap = pmax(sigscore, quantile(sigscore, 0.05)) %>% pmin(., quantile(sigscore, 0.95))) %>% 
+    arrange(sigscore_cap)
+  lmt <- ceiling(10*max(abs(range(plt_df$sigscore_cap))))/10
+  plist_umap[[x]] <- ggplot(plt_df, aes(x = UMAP_1, y = UMAP_2, color = sigscore_cap)) +
+    geom_point(size = 0.5) +
+    coord_fixed() +
+    # scale_color_gradientn(colors = c("#22578B", "#73A9D2", "white", "#FDB393", "#b22222"), limits = c(-lmt, lmt)) +
+    scale_color_gradientn(colors = c("#22578B", "#73A9D2", "white", "#FDB393", "#b22222")) +
+    labs(color = "Signature score", title = x) +
+    theme_classic() +
+    theme(axis.text = element_blank(),
+        axis.ticks = element_blank(),
+        plot.title = element_text(hjust = 0.5, face = "bold"),
+        panel.background = element_blank(),
+        panel.border = element_rect(color = "black", fill = NA))
+  
+  if (x == "Penk_WT") {
+    comparison_ls <- list(c("T1", "T7"), c("T0", "T7"), c("T1", "T4"), c("T0", "T4"), c("T1", "T9"), c("T0", "T9"))
+    step_increase <- 0.08
+    margin_top <- 0.05
+  } else if (x == "Penk_KO") {
+    comparison_ls <- list(c("T4", "T7"), c("T1", "T7"), c("T0", "T7"), c("T1", "T4"), c("T0", "T4"), c("T1", "T9"), c("T0", "T9"))
+    step_increase <- 0.08
+    margin_top <- -0.1
+  }
+  
+  plist_vln[[x]] <- ggplot(plt_df, aes(x = cluster_name, y = sigscore, color = cluster_name)) +
+    geom_quasirandom(size = 0.5) +
+    geom_boxplot(outliers = FALSE, fill = NA, color = "black", width = 0.1) +
+    coord_fixed(ratio = 10) +
+    geom_signif(comparisons = comparison_ls, margin_top = margin_top,
+                step_increase = step_increase, color = "black", textsize = 3) +
+    scale_color_manual(values = color_cluster_T) +
+    scale_y_continuous(expand = expansion(mult = c(0.05, 0.05))) +
+    labs(x = "", y = "Signature score") +
+    theme_classic() +
+    theme(legend.position = "none", plot.margin = margin(t = 0.1, r = 0.1, l = 0.1, b = 0.01, unit = 'in'),
+          # plot.title = element_text(hjust = 0.5, face = "bold", size = 16),
+          axis.text.x = element_text(angle = 0, hjust = 0.5, color = "black", size = 12),
+          axis.text.y = element_text(color = "black", size = 12),
+          axis.title = element_text(color = "black", size = 14))
+}
+
+library(cowplot)
+pdf(paste0("4B_UMAP_Penk_signatures_", Sys.Date(), ".pdf"), width = 10, height = 6)
+# plot_grid(plotlist = plist_umap, ncol = 1, align = "hv")
+for (i in names(plist_umap)) {
+  grid.arrange(plist_umap[[i]], plist_vln[[i]], nrow = 1, widths = c(1, 0.5), top = textGrob(sigs_to_plot[i], gp = gpar(fontsize = 14)))
+}
+dev.off()
+
+
+```
+
+
+## 4C. Scatter plot to compare Penk vs. CD8 signatures
+
+1. Penk KO correlated with short-lived
+2. Penk WT correlated with terminally dysfunctional
+```{r}
+plt_df <- data.frame(score_eff = cd8$`Short-lived effectors signature`,
+                       score_dysf = cd8$`Dysfunctional CD8`,
+                     score_ko = cd8$Penk_KO,
+                     score_wt = cd8$Penk_WT,
+                       cluster_name = cd8$cluster_name %>% factor(levels = cd8_cluster_vec), 
+                       annotation = cd8$annotation) %>% 
+  filter(cluster_name == "T7")
+
+p1 <- ggplot(plt_df, aes(x = score_ko, y = score_wt, color = score_eff)) +
+  geom_point() +
+  scale_color_gradientn(colors = rev(brewer.pal(11, "RdYlBu"))) +
+  theme_classic() +
+  labs(x = "PENK KO signature score", y = "PENK WT signature score", color = "Short-lived effectors\nsignature score")
+p2 <- ggplot(plt_df, aes(x = score_ko, y = score_wt, color = score_dysf)) +
+  geom_point() +
+  scale_color_gradientn(colors = rev(brewer.pal(11, "RdYlBu"))) +
+  theme_classic() +
+  labs(x = "PENK KO signature score", y = "PENK WT signature score", color = "Terminally dysfunction\nsignature score")
+
+
+pdf(paste0("4C_scatter_T7_penk_vs_cd8_signatures_", Sys.Date(), ".pdf"), width = 7, height = 4)
+p1
+p2
+dev.off()
+```
+
+
+
+## 4D. Scatter plot non-responder score vs. Penk signatures in CD8 clusters
+```{r}
+df_cor <- rbind(
+  sapply(levels(cd8$cluster_annotation), function(x) {
+    tmp <- cd8@meta.data[cd8$cluster_annotation == x,]
+    res <- cor.test(tmp$Penk_WT, tmp$Non_responder, method = "spearman")
+    c("p" = res$p.value, "rho" = as.numeric(res$estimate), "Non_responder" = as.numeric(quantile(tmp$Non_responder, 0.25)))
+  }) %>% t %>% 
+    data.frame() %>% 
+    rownames_to_column("cluster_annotation") %>% 
+    mutate(genotype = "WT"),
+  sapply(levels(cd8$cluster_annotation), function(x) {
+    tmp <- cd8@meta.data[cd8$cluster_annotation == x,]
+    res <- cor.test(tmp$Penk_KO, tmp$Non_responder, method = "spearman")
+    c("p" = res$p.value, "rho" = as.numeric(res$estimate), "Non_responder" = as.numeric(quantile(tmp$Non_responder, 0.25)))
+  }) %>% t %>% 
+    data.frame() %>% 
+    rownames_to_column("cluster_annotation") %>% 
+    mutate(genotype = "KO")
+) %>%
+  mutate(cor_label = paste0("rho = ", sprintf("%.2f", rho), "\np ", ifelse(p < 2.2e-16, "< 2.2e-16", paste0("= ", formatC(p, digits = 1, format = "e")))),
+         cluster_annotation = factor(cluster_annotation, levels = levels(cd8$cluster_annotation)))
+
+p_wt <- cd8@meta.data %>% 
+  ggplot(., aes(x = Non_responder, y = Penk_WT, color = cluster_annotation)) +
+  geom_point(alpha = 0.2) +
+  geom_density_2d(color = "black", linewidth = 0.1) +
+  geom_smooth(color = "black", method = "lm") +
+  geom_text(data = df_cor %>% filter(genotype == "WT"), mapping = aes(label = cor_label), y = 0.3, color = "black", hjust = 0) +
+  scale_fill_gradient(low = "white", high = "blue") +
+  scale_color_manual(values = color_cluster_annotation_cd8) +
+  facet_grid(~cluster_annotation, scales = "free") +
+  labs(x = "Non responder signature score", y = "Penk WT signature score") +
+  theme_classic() +
+  theme(
+    legend.position = "none",
+    panel.background = element_blank(),
+    panel.border = element_rect(color = "black", fill = NA))
+
+p_ko <-
+  cd8@meta.data %>% 
+  ggplot(., aes(x = Non_responder, y = Penk_KO, color = cluster_annotation)) +
+  geom_point(alpha = 0.2) +
+  geom_density_2d(color = "black", linewidth = 0.1) +
+  geom_smooth(color = "black", method = "lm") +
+  geom_text(data = df_cor %>% filter(genotype == "KO"), mapping = aes(label = cor_label), y = 0.35, color = "black", hjust = 0) +
+  scale_fill_gradient(low = "white", high = "blue") +
+  facet_grid(~cluster_annotation, scales = "free") +
+  scale_color_manual(values = color_cluster_annotation_cd8) +
+  labs(x = "Non responder signature score", y = "Penk KO signature score") +
+  theme_classic() +
+  theme(
+    legend.position = "none",
+    panel.background = element_blank(),
+    panel.border = element_rect(color = "black", fill = NA))
+
+
+
+pdf(paste0("4D_scatter_signature_penk_vs_NR_", Sys.Date(), ".pdf"), width = 12, height = 3.5)
+p_wt
+p_ko
+dev.off()
+```
+
+## 4E. GEPIA2 survival analysis.
+Convert mouse gene names into human gene names.
+```{r}
+source("~/project/utils/map_genes/map_human_mouse_genes.R")
+penk_sig <- list(
+  Penk_KO = de_res$gene[which(de_res$direction_top_200_padj == "KO")],
+  Penk_WT = de_res$gene[which(de_res$direction_top_200_padj == "WT")]
+)
+
+penk_sig_human <- mouse_to_human(penk_sig)
+
+write.xlsx(penk_sig_human, paste0("Penk_signatures_converted_to_human_", Sys.Date(), ".xlsx"))
+```
+
+
+

@@ -1,0 +1,701 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+```{r, message=FALSE}
+renv::load("~/project/b16_davide/")
+rm(list = ls())
+# library(Seurat, lib.loc = "~/R")
+library(Seurat)
+library(tidyverse)
+library(ggrepel)
+library(Matrix)
+library(sparseMatrixStats)
+library(DESeq2)
+library(edgeR)
+library(ggsignif)
+library(openxlsx)
+library(gridExtra)
+library(enrichR)
+```
+
+
+## Data QC
+
+
+### Reads and alignment rates
+```{r}
+df_sample <- read.table("../../0_data/bulk_RNAseq_Penk_KO_hisat2_0914/barcodes.tsv.gz", header = TRUE)
+
+df_sample <- df_sample %>% 
+  separate(barcodekey, c("genotype", "mouse"), remove = FALSE) %>% 
+  mutate(sample_id = paste(genotype, mouse, sep = "_"),
+         genotype = factor(genotype, levels = c("WT", "KO")))
+
+ggplot(df_sample, aes(x = total_reads, y = alignment_rate, fill = unique_rate, label = barcodekey)) +
+  geom_point(shape = 21, color = "black", size = 3, alpha = 1) +
+  geom_text_repel(color = "black", size = 4, alpha = 0.3) +
+  scale_fill_viridis_c(option = "D") +
+  theme_bw()
+
+ggplot(df_sample, aes(x = total_reads, y = alignment_rate, fill = genotype, label = barcodekey)) +
+  geom_point(shape = 21, color = "black", size = 3, alpha = 1) +
+  geom_text_repel(color = "black", size = 4, alpha = 0.3) +
+  scale_fill_manual(values = c("KO" = "red", "WT" = "grey")) +
+  theme_bw()
+```
+
+
+```{r}
+cts <- ReadMtx(mtx = "../../0_data/bulk_RNAseq_Penk_KO_hisat2_0914/matrix.mtx.gz", 
+               cells = "../../0_data/bulk_RNAseq_Penk_KO_hisat2_0914/barcodes.tsv.gz", 
+               cell.column = 1, skip.cell = 1,
+               features = "../../0_data/bulk_RNAseq_Penk_KO_hisat2_0914/features.tsv.gz",
+               feature.column = 1, skip.feature = 1, unique.features = FALSE)
+duplicated(rownames(cts)) %>% sum
+dim(cts)
+
+dds <- DESeqDataSetFromMatrix(countData = cts, colData = df_sample, design = ~genotype)
+```
+
+<!-- #### Create DGEList object (edgeR) -->
+<!-- ```{r} -->
+<!-- dge <- DGEList(counts = cts, samples = df_sample) -->
+<!-- design_mtx <- model.matrix(~genotype, dge$samples) -->
+<!-- expressed_gene <- filterByExpr(dge, design = design_mtx) -->
+<!-- protein_coding <- read.table("~/general_data/GencodeM23_GRCm38/protein_coding_genes_only.gtf", sep = "\t") -->
+<!-- protein_coding$gene_name <- protein_coding$V9 %>% gsub(".*gene_name ", "", .) %>% gsub(";.*", "", .) -->
+<!-- protein_coding_gene <- rownames(dge) %in% protein_coding$gene_name -->
+<!-- dge <- dge[expressed_gene & protein_coding_gene,] -->
+<!-- dge <- calcNormFactors(dge) -->
+<!-- dge <- estimateDisp(dge) -->
+<!-- saveRDS(dge, file = "dge.rds") -->
+<!-- ``` -->
+
+### PCA
+```{r}
+color_genotype <- c("WT" = "steelblue", "KO" = "salmon")
+library(ggrepel)
+n_hvg <- 500
+vsd <- vst(dds)
+
+idx_hvg <- order(rowSds(assay(vsd)), decreasing = TRUE)[1:n_hvg]
+expr_mtx <- t(scale(t(assay(vsd))))[idx_hvg,]
+
+# pc <- prcomp(t(expr_mtx))
+# plt_df <- data.frame(pc$x) %>% 
+#   mutate(Genotype = vsd$genotype,
+#          label = vsd$barcodekey) %>% 
+#   droplevels()
+pc <- prcomp(t(expr_mtx))
+plt_df <- data.frame(pc$x) %>% 
+  mutate(Genotype = vsd$genotype,
+         label = vsd$barcodekey) %>% 
+  droplevels()
+pct_var <- (pc$sdev^2) / sum(pc$sdev^2) * 100
+
+
+p_1_2 <- ggplot(plt_df, aes(x = PC1, y = PC2, color = Genotype, label = label)) +
+  geom_point(size = 4, alpha = 1, stroke = 1) +
+  # geom_abline(intercept = -2, slope = 0.5, linetype = 2, color = "grey") +
+  geom_text_repel(color = "black") +
+  scale_color_manual(values = color_genotype) +
+  labs(x = paste0("Principle Component 1 (", sprintf("%.1f", pct_var[1]), "%)"),
+       y = paste0("Principle Component 2 (", sprintf("%.1f", pct_var[2]), "%)"),
+       color = "Genotype", title = "") +
+  theme_classic() +
+  theme(legend.background = element_rect(color = "black"),
+        axis.text.x = element_text(size = 14, color = "black"))
+p_3_4 <- ggplot(plt_df, aes(x = PC3, y = PC4, color = Genotype, label = label)) +
+  geom_point(size = 4, alpha = 1, stroke = 1) +
+  # geom_abline(intercept = -2, slope = 0.5, linetype = 2, color = "grey") +
+  geom_text_repel(color = "black") +
+  scale_color_manual(values = color_genotype) +
+  labs(x = paste0("Principle Component 3 (", sprintf("%.1f", pct_var[3]), "%)"),
+       y = paste0("Principle Component 4 (", sprintf("%.1f", pct_var[4]), "%)"),
+       color = "Genotype", title = "") +
+  theme_classic() +
+  theme(legend.background = element_rect(color = "black"),
+        axis.text.x = element_text(size = 14, color = "black"))
+pdf(paste0("PCA_no_filter.pdf"), width = 14, height = 5)
+grid.arrange(p_1_2, p_3_4, nrow = 1)
+dev.off()
+
+plt_df_pc1 <- data.frame(pc$rotation) %>% 
+  rownames_to_column("gene") %>% 
+  filter((rank(PC1) < 30) | (rank(-PC1) < 30)) %>% 
+  arrange(PC1) %>% 
+  mutate(gene = factor(gene, levels = gene))
+p_1 <- ggplot(plt_df_pc1, aes(x = gene, y = PC1)) +
+  geom_point() +
+  geom_bar(stat = "identity", width = 0.1) +
+  geom_hline(yintercept = 0, linewidth = 1) +
+  theme_classic() +
+  labs(x = "", title = "PC1") +
+  theme(axis.text.x = element_text(angle = 60, hjust = 1))
+
+plt_df_pc2 <- data.frame(pc$rotation) %>% 
+  rownames_to_column("gene") %>% 
+  filter((rank(PC2) < 30) | (rank(-PC2) < 30)) %>% 
+  arrange(PC2) %>% 
+  mutate(gene = factor(gene, levels = gene))
+p_2 <- ggplot(plt_df_pc2, aes(x = gene, y = PC2)) +
+  geom_point() +
+  geom_bar(stat = "identity", width = 0.1) +
+  geom_hline(yintercept = 0, linewidth = 1) +
+  theme_classic() +
+  labs(x = "", title = "PC2") +
+  theme(axis.text.x = element_text(angle = 60, hjust = 1))
+
+dbs <- c("KEGG_2019_Mouse", "GO_Molecular_Function_2023", "GO_Cellular_Component_2023", "GO_Biological_Process_2023")
+enriched_pc1_pos <- enrichr(plt_df_pc1$gene[plt_df_pc1$PC1 > 0] %>% as.character(), dbs)
+enriched_pc1_neg <- enrichr(plt_df_pc1$gene[plt_df_pc1$PC1 < 0] %>% as.character(), dbs)
+enriched_pc2_pos <- enrichr(plt_df_pc2$gene[plt_df_pc2$PC2 > 0] %>% as.character(), dbs)
+enriched_pc2_neg <- enrichr(plt_df_pc2$gene[plt_df_pc2$PC2 < 0] %>% as.character(), dbs)
+
+pdf("enrichr_pc1_pc2.pdf", width = 20, height = 10)
+for (i in dbs) {
+  p1_pos <- plotEnrich(enriched_pc1_pos[[i]], showTerms = 50, numChar = 50, y = "Count", orderBy = "P.value") + labs(subtitle = i, title = "PC1 pos")
+  p1_neg <- plotEnrich(enriched_pc1_neg[[i]], showTerms = 50, numChar = 50, y = "Count", orderBy = "P.value") + labs(subtitle = i, title = "PC1 neg")
+  p2_pos <- plotEnrich(enriched_pc2_pos[[i]], showTerms = 50, numChar = 50, y = "Count", orderBy = "P.value") + labs(subtitle = i, title = "PC2 pos")
+  p2_neg <- plotEnrich(enriched_pc2_neg[[i]], showTerms = 50, numChar = 50, y = "Count", orderBy = "P.value") + labs(subtitle = i, title = "PC2 neg")
+  gridExtra::grid.arrange(p1_pos, p1_neg, nrow = 1)
+  gridExtra::grid.arrange(p2_pos, p2_neg, nrow = 1)
+}
+dev.off()
+
+pdf(paste0("PC_loading_no_filter_PC1_PC2.pdf"), width = 10, height = 5)
+print(p_1)
+print(p_2)
+dev.off()
+
+genes_to_plot <- c("Cd19", "Cd3e", "Cd4", "Cd8a", "Penk", "Slamf6", "Cxcr6", "Tcf7", "Havcr2", "Cxcl13") %>% union(., c("Penk", "Gzmb", "Ifng", "Il2", "Tnf", "Tcf7", "Cx3cr1", "Eomes", "Tox", "Pdcd1", "Havcr2", "Entpd1"))
+plist <- sapply(genes_to_plot, function(g) {
+  plt_df <- data.frame(
+    expr = as.numeric(assay(vsd)[g,]),
+    Genotype = vsd$genotype,
+    label = vsd$barcodekey
+  )
+  ggplot(plt_df, aes(x = label, y = expr, color = Genotype)) +
+    geom_point(size = 4, alpha = 0.7) +
+    # geom_text_repel(color = "black") +
+    facet_wrap(~Genotype, scales = "free_x", nrow = 1) +
+    theme_classic() +
+    scale_color_manual(values = color_genotype) +
+    labs(x = "", y = "Expression (DESeq2 vst)", title = paste0(g, " expression")) +
+    theme(axis.text.x = element_text(angle = 60, hjust = 1))
+}, simplify = FALSE)
+
+pdf("genes_of_interest.pdf", height = 4)
+plist
+dev.off()
+```
+
+### Filter outliers based on PCA.
+
+```{r}
+sample_to_exclude <- c("KO_3812", "WT_3808")
+dds_filt <- dds[,!(dds$barcodekey %in% sample_to_exclude)]
+saveRDS(dds_filt, "dds_filt.rds")
+colnames(dds_filt)
+write.csv(counts(dds_filt), "counts_filt.csv")
+```
+
+Re-run PCA
+```{r}
+color_genotype <- c("WT" = "steelblue", "KO" = "salmon")
+library(ggrepel)
+n_hvg <- 500
+vsd_filt <- vst(dds_filt)
+
+idx_hvg <- order(rowSds(assay(vsd_filt)), decreasing = TRUE)[1:n_hvg]
+expr_mtx <- t(scale(t(assay(vsd_filt))))[idx_hvg,]
+
+pc <- prcomp(t(expr_mtx))
+plt_df <- data.frame(pc$x) %>% 
+  mutate(Genotype = vsd_filt$genotype,
+         label = vsd_filt$barcodekey) %>% 
+  droplevels()
+pct_var <- (pc$sdev^2) / sum(pc$sdev^2) * 100
+
+
+p_1_2 <- ggplot(plt_df, aes(x = PC1, y = PC2, color = Genotype, label = label)) +
+  geom_point(size = 4, alpha = 1, stroke = 1) +
+  # geom_abline(intercept = -2, slope = 0.5, linetype = 2, color = "grey") +
+  geom_text_repel(color = "black") +
+  scale_color_manual(values = color_genotype) +
+  labs(x = paste0("Principle Component 1 (", sprintf("%.1f", pct_var[1]), "%)"),
+       y = paste0("Principle Component 2 (", sprintf("%.1f", pct_var[2]), "%)"),
+       color = "Genotype", title = "") +
+  theme_classic() +
+  theme(legend.background = element_rect(color = "black"),
+        axis.text.x = element_text(size = 14, color = "black"))
+p_3_4 <- ggplot(plt_df, aes(x = PC3, y = PC4, color = Genotype, label = label)) +
+  geom_point(size = 4, alpha = 1, stroke = 1) +
+  # geom_abline(intercept = -2, slope = 0.5, linetype = 2, color = "grey") +
+  geom_text_repel(color = "black") +
+  scale_color_manual(values = color_genotype) +
+  labs(x = paste0("Principle Component 3 (", sprintf("%.1f", pct_var[3]), "%)"),
+       y = paste0("Principle Component 4 (", sprintf("%.1f", pct_var[4]), "%)"),
+       color = "Genotype", title = "") +
+  theme_classic() +
+  theme(legend.background = element_rect(color = "black"),
+        axis.text.x = element_text(size = 14, color = "black"))
+pdf(paste0("PCA_filtered.pdf"), width = 14, height = 5)
+grid.arrange(p_1_2, p_3_4, nrow = 1)
+dev.off()
+```
+
+No more outliers.
+Further filtering based on gene types.
+```{r}
+gene_info <- readRDS("~/project/general_data/genes_refdata-gex-mm10-2020-A_genes.rds")
+keep_genes <- gene_info$gene_name[gene_info$gene_type == "protein_coding"] %>% 
+  grep("^Gm[0-9]+$|Rik$", ., value = TRUE, invert = TRUE) %>% 
+  intersect(rownames(dds_filt))
+dds_filt_gene_sample <- dds_filt[keep_genes,]
+vsd_filt_gene_sample <- vst(dds_filt_gene_sample)
+```
+
+Re-run PCA
+```{r}
+color_genotype <- c("WT" = "steelblue", "KO" = "salmon")
+library(ggrepel)
+n_hvg <- 500
+
+idx_hvg <- order(rowSds(assay(vsd_filt_gene_sample)), decreasing = TRUE)[1:n_hvg]
+expr_mtx <- t(scale(t(assay(vsd_filt_gene_sample))))[idx_hvg,]
+
+pc <- prcomp(t(expr_mtx))
+plt_df <- data.frame(pc$x) %>% 
+  mutate(Genotype = vsd_filt_gene_sample$genotype,
+         label = vsd_filt_gene_sample$barcodekey) %>% 
+  droplevels()
+pct_var <- (pc$sdev^2) / sum(pc$sdev^2) * 100
+
+
+p_1_2 <- ggplot(plt_df, aes(x = PC1, y = PC2, color = Genotype, label = label)) +
+  geom_point(size = 4, alpha = 1, stroke = 1) +
+  # geom_abline(intercept = -2, slope = 0.5, linetype = 2, color = "grey") +
+  geom_text_repel(color = "black") +
+  scale_color_manual(values = color_genotype) +
+  labs(x = paste0("Principle Component 1 (", sprintf("%.1f", pct_var[1]), "%)"),
+       y = paste0("Principle Component 2 (", sprintf("%.1f", pct_var[2]), "%)"),
+       color = "Genotype", title = "") +
+  theme_classic() +
+  theme(legend.background = element_rect(color = "black"),
+        axis.text.x = element_text(size = 14, color = "black"))
+p_3_4 <- ggplot(plt_df, aes(x = PC3, y = PC4, color = Genotype, label = label)) +
+  geom_point(size = 4, alpha = 1, stroke = 1) +
+  # geom_abline(intercept = -2, slope = 0.5, linetype = 2, color = "grey") +
+  geom_text_repel(color = "black") +
+  scale_color_manual(values = color_genotype) +
+  labs(x = paste0("Principle Component 3 (", sprintf("%.1f", pct_var[3]), "%)"),
+       y = paste0("Principle Component 4 (", sprintf("%.1f", pct_var[4]), "%)"),
+       color = "Genotype", title = "") +
+  theme_classic() +
+  theme(legend.background = element_rect(color = "black"),
+        axis.text.x = element_text(size = 14, color = "black"))
+pdf(paste0("PCA_filtered_gene_and_sample.pdf"), width = 14, height = 5)
+grid.arrange(p_1_2, p_3_4, nrow = 1)
+dev.off()
+```
+
+
+Differential expression.
+```{r}
+dds_filt_gene_sample <- DESeq(dds_filt_gene_sample)
+resultsNames(dds_filt_gene_sample)
+
+deg_filt_gene_sample <- results(dds_filt_gene_sample, name = "genotype_KO_vs_WT") %>% 
+  data.frame() %>% rownames_to_column("gene")
+  
+
+# View(data.frame(deg_filt_gene_sample) %>% rownames_to_column("gene"))
+saveRDS(deg_filt_gene_sample, "deg_filt_gene_sample.rds")
+```
+
+
+### expression of genes of interest.
+```{r}
+genes_to_plot <- c("Cd19", "Cd3e", "Cd4", "Cd8a", "Penk", "Slamf6", "Cxcr6", "Tcf7", "Havcr2", "Cxcl13") %>% union(., c("Penk", "Gzmb", "Ifng", "Il2", "Tnf", "Tcf7", "Cx3cr1", "Eomes", "Tox", "Pdcd1", "Havcr2", "Entpd1"))
+plist <- sapply(genes_to_plot, function(g) {
+  plt_df <- data.frame(
+    expr = as.numeric(assay(vsd_filt_gene_sample)[g,]),
+    Genotype = vsd_filt_gene_sample$genotype,
+    label = vsd_filt_gene_sample$barcodekey
+  )
+  ggplot(plt_df, aes(x = Genotype, y = expr, color = Genotype)) +
+    geom_jitter(size = 4, alpha = 1, width = 0.2) +
+    # geom_text_repel(color = "black") +
+    geom_signif(comparisons = list(c("WT", "KO")), test = "t.test", color = "black") +
+    theme_classic() +
+    scale_color_manual(values = color_genotype) +
+    labs(x = "", y = "Expression (DESeq2 vst)", title = paste0(g, " expression"), caption = "p-value from t-test") +
+    theme(axis.text.x = element_text(angle = 60, hjust = 1))
+}, simplify = FALSE)
+
+pdf("genes_of_interest_filtered_gene_sample.pdf", height = 4)
+plist
+dev.off()
+```
+
+MA and volcano plot.
+```{r}
+deg_filt_gene_sample <- readRDS("deg_filt_gene_sample.rds")
+thresh_lfc <- log2(1.5)
+thresh_padj <- 0.2
+plt_df <- deg_filt_gene_sample %>% 
+  filter(!is.na(padj)) %>% 
+  mutate(padj = ifelse(is.na(padj), 1, padj),
+         pvalue = ifelse(is.na(pvalue), 1, pvalue),
+         log2FoldChange = ifelse(is.na(log2FoldChange), 0, log2FoldChange)) %>% 
+  mutate(up_in = ifelse((abs(log2FoldChange) <= thresh_lfc) | (padj >= thresh_padj), "n.s.",
+                        ifelse(log2FoldChange > 0, "KO", "WT")) %>% factor(levels = c("KO", "WT", "n.s."))) %>% 
+  mutate(pvalue_cap = pmax(10^-10, pvalue),
+         log2FoldChange_cap = pmax(log2FoldChange, -7.5) %>% pmin(., 7.5),
+         gene_label = ifelse((up_in != "n.s.") | (gene %in% genes_to_plot), gene, NA)) %>% 
+  arrange(-is.na(gene_label))
+
+threshold_p <- plt_df$pvalue[which.min(abs(plt_df$padj - thresh_padj))]
+df_p_thresh <- data.frame(
+  x = rep(max(plt_df$log2FoldChange_cap), 2),
+  y = c(-log10(0.05), -log10(threshold_p)),
+  label = c("p = 0.05", paste0("FDR = ", thresh_padj)),
+  up_in = rep("n.s.", 2)
+)
+p_volcano <- ggplot(plt_df, aes(x = log2FoldChange_cap, y = -log10(pvalue_cap), fill = up_in, color = is.na(gene_label))) +
+  geom_point(shape = 21) + 
+  geom_text_repel(aes(label = gene_label), color = "black", max.overlaps = Inf) +
+  geom_vline(xintercept = c(-thresh_lfc, thresh_lfc), color = "black", linetype = 2, linewidth = 0.2) +
+  geom_hline(yintercept = df_p_thresh$y, color = "black", linetype = 2, linewidth = 0.2) +
+  geom_text(data = df_p_thresh, aes(x = x, y = y, label = label), color = "black", vjust = 1) +
+  scale_fill_manual(values = c(color_genotype, "n.s." = "grey90")) +
+  scale_color_manual(values = c("TRUE" = "grey90", "FALSE" = "black")) +
+  labs(x = "WT <---- log2 fold change ----> KO",
+       y = "-log10(p-value)",
+       caption = paste0("|log2foldchange|>", round(thresh_lfc, 2), ", FDR < ", thresh_padj),
+       fill = "Upregulated in") +
+  theme_classic()
+p_ma <- ggplot(plt_df, aes(x = log2(baseMean), y = log2FoldChange_cap, fill = up_in, color = is.na(gene_label))) +
+  geom_point(shape = 21) + 
+  geom_hline(yintercept = 0, color = "black") +
+  geom_hline(yintercept = c(-thresh_lfc, thresh_lfc), color = "black", linetype = 2, linewidth = 0.2) +
+  geom_text_repel(aes(label = gene_label), color = "black", max.overlaps = Inf) +
+  scale_fill_manual(values = c(color_genotype, "n.s." = "grey90")) +
+  scale_color_manual(values = c("TRUE" = "grey90", "FALSE" = "black")) +
+  labs(x = "Average expression",
+       y = "WT <---- log2 fold change ----> KO",
+       caption = paste0("|log2foldchange|>", round(thresh_lfc, 2), ", FDR < ", thresh_padj),
+       fill = "Upregulated in") +
+  theme_classic()
+pdf("volcano_ma_wt_vs_ko.pdf", width = 14, height = 8)
+p_volcano
+p_ma
+dev.off()
+
+write.xlsx(plt_df %>% select(gene, baseMean, log2FoldChange, lfcSE, stat, pvalue, padj, up_in),
+           "de_KO_vs_WT_filtered.xlsx")
+```
+
+
+Enrichment
+```{r}
+library(enrichR)
+
+# listEnrichrDbs() %>% View()
+dbs <- c("GO_Molecular_Function_2023", "GO_Cellular_Component_2023", "GO_Biological_Process_2023", "KEGG_2019_Mouse", "MSigDB_Hallmark_2020")
+plt_df_top <- plt_df %>% 
+  mutate(direction = ifelse(log2FoldChange > 0, "KO", "WT")) %>% 
+  slice_min(order_by = pvalue, n = 200, by = direction)
+up_ko <- plt_df_top$gene[plt_df_top$direction == "KO"]
+up_wt <- plt_df_top$gene[plt_df_top$direction == "WT"]
+enriched_ko <- enrichr(up_ko, dbs)
+enriched_wt <- enrichr(up_wt, dbs)
+
+pdf("enrichr_filtered_gene_sample_top200_pvalue.pdf", width = 20, height = 10)
+for (i in names(enriched_ko)) {
+  p1 <- plotEnrich(enriched_ko[[i]], showTerms = 50, numChar = 50, y = "Count", orderBy = "P.value") + labs(subtitle = i, title = "Up in KO")
+  p2 <- plotEnrich(enriched_wt[[i]], showTerms = 50, numChar = 50, y = "Count", orderBy = "P.value") + labs(subtitle = i, title = "Down in KO")
+  gridExtra::grid.arrange(p1, p2, nrow = 1)
+}
+dev.off()
+
+saveRDS(enriched_ko, "enrichr_ko_filtered_gene_sample_top200_pvalue.rds")
+saveRDS(enriched_wt, "enrichr_wt_filtered_gene_sample_top200_pvalue.rds")
+
+library(openxlsx)
+wb <- createWorkbook()
+sapply(names(enriched_ko), function(x) {
+  addWorksheet(wb, x)
+  writeData(wb, x, enriched_ko[[x]])
+})
+saveWorkbook(wb, "enrichr_up_ko_filtered_gene_sample_top200_pvalue.xlsx")
+
+library(openxlsx)
+wb <- createWorkbook()
+sapply(names(enriched_wt), function(x) {
+  addWorksheet(wb, x)
+  writeData(wb, x, enriched_wt[[x]])
+})
+saveWorkbook(wb, "enrichr_down_ko_filtered_gene_sample_top200_pvalue.xlsx")
+
+```
+
+```{r}
+deg_old <- read.xlsx("diff_expr_KO_vs_WT.xlsx")
+deg_filt_gene_sample <- deg_filt_gene_sample %>% 
+  mutate(up_in = ifelse((abs(log2FoldChange) <= thresh_lfc) | (padj >= thresh_padj), "n.s.",
+                        ifelse(log2FoldChange > 0, "KO", "WT")) %>% factor(levels = c("KO", "WT", "n.s.")))
+tmp2 <- merge(deg_old, deg_filt_gene_sample, by = "gene", all = TRUE)
+tmp2$label <- ifelse(abs(tmp2$logFC - tmp2$log2FoldChange) > 2, tmp$gene, NA)
+table(is.na(tmp2$label))
+tmp2_sub <- tmp2 %>% 
+  filter(!is.na(padj), !is.na(FDR)) 
+ggplot(tmp2_sub, aes(x = logFC, y = log2FoldChange)) +
+  geom_point() +
+  geom_abline(slope = 1, intercept = 0, color = "grey", linetype = 2) +
+  geom_smooth(method = "gam") +
+  geom_text_repel(aes(label = label)) +
+  labs(x = "log2 fold change without unfiltered", y = "log2 fold change filtered") +
+  theme_classic()
+cor.test(tmp2_sub$logFC, tmp2_sub$log2FoldChange)
+table(deg_filt_gene_sample$gene[!is.na(deg_filt_gene_sample$padj)] %in% tmp$gene)
+tmp2$direction <- factor(tmp2$direction, levels = c("KO", "WT", "n.s."))
+table(Old = tmp2$direction, New = tmp2$up_in, useNA = "i")
+
+plot(sqrt(tmp2$LR) * (2*(tmp2$logFC>0)-1), tmp2$stat)
+cor.test(sqrt(tmp2$LR) * (2*(tmp2$logFC>0)-1), tmp2$stat)
+
+plot(tmp2$PValue, tmp2$pvalue)
+cor.test(tmp2$PValue, tmp2$pvalue)
+```
+```{r}
+write.xlsx(tmp2_sub, "compare_old_and_new.xlsx")
+```
+
+
+<!-- ### Expression of Penk -->
+<!-- ```{r} -->
+
+<!-- log2cpm <- log2(cpm(dge, normalized.lib.sizes = TRUE, log = FALSE) + 1) -->
+
+<!-- genes_of_interest <- c("Penk", "Gzmb", "Ifng", "Il2", "Tnf", "Tcf7", "Cx3cr1", "Eomes", "Tox", "Pdcd1", "Havcr2", "Entpd1") -->
+<!-- plt_df <- data.frame( -->
+<!--   dge$samples, -->
+<!--   t(log2cpm[genes_of_interest,,drop = FALSE]) -->
+<!-- ) %>% gather(key = "gene", value = "expression", -colnames(dge$samples)) %>%  -->
+<!--   mutate(gene = factor(gene, levels = genes_of_interest), -->
+<!--          genotype = factor(genotype, levels = c("WT", "KO"))) -->
+<!-- ggplot(plt_df, aes(x = genotype, y = expression, color = genotype)) + -->
+<!--   geom_point(size = 4, shape = 21, stroke = 1.5) + -->
+<!--   geom_boxplot(fill = NA, outlier.shape = NA, width = 0.2, color = "black") + -->
+<!--   geom_signif(comparisons = list(c("WT", "KO")), color = "black", margin_top = 0.1, test = "t.test") + -->
+<!--   facet_wrap(~gene, nrow = 1) + -->
+<!--   scale_y_continuous(expand = c(0.1, 0)) + -->
+<!--   scale_color_manual(values = c("KO" = "red", "WT" = "grey")) + -->
+<!--   labs(x = "", y = "Expression (log2(CPM + 1))", color = "") + -->
+<!--   theme_bw() + -->
+<!--   theme(strip.text = element_text(face = "italic", size = 12), -->
+<!--         axis.text.x = element_text(color = "black", size = 12)) -->
+<!-- ``` -->
+
+<!-- ### PCA -->
+<!-- ```{r} -->
+
+<!-- log2cpm <- log2(cpm(dge, normalized.lib.sizes = TRUE, log = FALSE) + 1) -->
+<!-- expr_scaled <- log2cpm %>% t() %>% scale() %>% t() -->
+<!-- pc <- prcomp(expr_scaled) -->
+
+<!-- pc$sdev^2 / sum(pc$sdev^2) -->
+<!-- pc$sdev/ sum(pc$sdev) -->
+
+<!-- stopifnot(all(rownames(pc$rotation) == rownames(dge$samples))) -->
+
+
+<!-- plist_pca <- list() -->
+<!-- for (i_pc in seq(1, length(pc$sdev), 2)) { -->
+<!--   x_pc <- colnames(pc$rotation)[i_pc] -->
+<!--   y_pc <- colnames(pc$rotation)[i_pc + 1] -->
+<!--   pct_var_x <- pc$sdev[i_pc]^2 / sum(pc$sdev^2) * 100 -->
+<!--   pct_var_y <- pc$sdev[i_pc+1]^2 / sum(pc$sdev^2) * 100 -->
+
+<!--   plt_df <- data.frame( -->
+<!--     pc_x = pc$rotation[,x_pc], -->
+<!--     pc_y = pc$rotation[,y_pc], -->
+<!--     genotype = dge$samples$genotype, -->
+<!--     sample = rownames(dge$samples) -->
+<!--   ) -->
+
+<!--   p <- ggplot(plt_df, aes(x = pc_x, y = pc_y)) + -->
+<!--     geom_point(aes(color = genotype), size = 4, shape = 19, stroke = 1.5) + -->
+<!--     geom_text_repel(aes(label = sample)) + -->
+<!--     scale_color_manual(values = c("KO" = "red", "WT" = "grey")) + -->
+<!--     labs(title = paste0(x_pc, " vs. ", y_pc), -->
+<!--          x = paste0(x_pc, "(", sprintf("%.0f", pct_var_x), "% var)"), y = paste0(y_pc, "(", sprintf("%.0f", pct_var_y), "% var)")) + -->
+<!--     theme_bw()  -->
+<!--   plist_pca[[x_pc]] <- p -->
+<!-- } -->
+
+<!-- pdf("pca.pdf", width = 14, height = 10) -->
+<!-- gridExtra::grid.arrange(grobs = plist_pca, nrow = 2) -->
+<!-- dev.off() -->
+
+<!-- plist_corr <- list() -->
+<!-- for (i_meta in 1:ncol(dge$samples)) { -->
+<!--   x_meta <- colnames(dge$samples)[i_meta] -->
+<!--   if (x_meta %in% c("group", "barcodekey", "plate")) next -->
+
+<!--   plist_corr[[x_meta]] <- list() -->
+<!--   for (i_pc in seq_along(pc$sdev)) { -->
+<!--     if (pc$sdev[i_pc] < 0.01) next -->
+<!--     x_pc <- colnames(pc$rotation)[i_pc] -->
+<!--     pct_var <- pc$sdev[i_pc]^2 / sum(pc$sdev^2) * 100 -->
+
+<!--     plt_df <- data.frame( -->
+<!--       pc = pc$rotation[,x_pc], -->
+<!--       meta = dge$samples[,x_meta], -->
+<!--       genotype = dge$samples$genotype -->
+<!--     ) -->
+
+<!--     m <- lm(pc ~ meta, data = plt_df) -->
+<!--     m_summ <- summary(m) -->
+<!--     pearson_r <- sqrt(m_summ$r.squared) * (m_summ$coefficients[2, "Estimate"] / abs(m_summ$coefficients[2, "Estimate"])) -->
+
+<!--     p <- ggplot(plt_df, aes(x = meta, y = pc)) + -->
+<!--       geom_point(aes(color = genotype), size = 4, shape = 21, stroke = 1.5) + -->
+<!--       geom_smooth(method = "lm", formula = 'y ~ x') + -->
+<!--       scale_color_manual(values = c("KO" = "red", "WT" = "grey")) + -->
+<!--       labs(title = paste0(x_pc, " vs. ", x_meta), -->
+<!--            subtitle = paste0("Pearson r = ", sprintf("%.3f", pearson_r), " (p-value = ", sprintf("%.3f", m_summ$coefficients[2,"Pr(>|t|)"]), ")"), -->
+<!--            y = paste0(x_pc, "(", sprintf("%.0f", pct_var), "% var)"), x = x_meta) + -->
+<!--       theme_bw()  -->
+<!--     plist_corr[[x_meta]][[x_pc]] <- p -->
+<!--   } -->
+<!-- } -->
+
+<!-- pdf("corr_pca_meta.pdf", width = 20, height = 8) -->
+<!-- lapply(plist_corr, function(x) { -->
+<!--   gridExtra::grid.arrange(grobs = x, nrow = 2) -->
+<!-- }) -->
+<!-- dev.off() -->
+
+
+
+<!-- ``` -->
+
+
+
+<!-- ## Differential expressin -->
+
+<!-- <!-- ```{r} --> -->
+<!-- <!-- dds <- DESeq(dds) --> -->
+<!-- <!-- resultsNames(dds) --> -->
+<!-- <!-- res_deseq2 <- results(dds, name = "genotype_KO_vs_WT") --> -->
+
+<!-- <!-- summary(res_deseq2) --> -->
+
+<!-- <!-- thresh_padj <- 0.05 --> -->
+<!-- <!-- ggplot(data.frame(res_deseq2) %>% arrange(-abs(log2FoldChange)), aes(x = log(baseMean), y = log2FoldChange, color = padj < thresh_padj)) + --> -->
+<!-- <!--   geom_point() + --> -->
+<!-- <!--   scale_color_manual(values = c("TRUE" = "red", "FALSE" = "black"), na.value = "grey") + --> -->
+<!-- <!--   theme_classic() --> -->
+
+<!-- <!-- ggplot(data.frame(res_deseq2), --> -->
+<!-- <!--        aes(x = log2FoldChange, y = -log10(pvalue), color = padj < thresh_padj)) + --> -->
+<!-- <!--   geom_point() + --> -->
+<!-- <!--   scale_color_manual(values = c("TRUE" = "red", "FALSE" = "black"), na.value = "grey") + --> -->
+<!-- <!--   theme_classic() --> -->
+<!-- <!-- ``` --> -->
+
+<!-- ```{r} -->
+<!-- dge$samples$unique_rate_scaled <- scale(dge$samples$unique_rate) -->
+<!-- design_mtx <- model.matrix(~genotype * unique_rate_scaled, data = dge$samples) -->
+<!-- lfit <- glmFit(dge, design = design_mtx, dispersion = dge$trended.dispersion) -->
+<!-- lrt <- glmLRT(lfit, contrast = c(0, 1, 0, 0)) -->
+
+<!-- res <- topTags(lrt, n = Inf) -->
+
+<!-- thresh_padj <- 0.2 -->
+<!-- plt_df <- res$table %>%  -->
+<!--   rownames_to_column("gene") %>%  -->
+<!--   mutate(direction = ifelse(FDR < thresh_padj,  -->
+<!--                             ifelse(logFC > 0, "KO", "WT"), "n.s."), -->
+<!--          label = ifelse(direction == "n.s.", NA, gene)) -->
+<!-- View(plt_df) -->
+<!-- write.xlsx(plt_df, file = "diff_expr_KO_vs_WT.xlsx", overwrite = TRUE) -->
+
+<!-- pdf("ma_volcano.pdf", width = 10, height = 7) -->
+<!-- ggplot(plt_df, aes(x = logCPM, y = logFC, color = direction)) + -->
+<!--   geom_point() + -->
+<!--   geom_text_repel(aes(label = label), show.legend = FALSE) + -->
+<!--   geom_hline(yintercept = 0, color = "black", linetype = 2) + -->
+<!--   scale_color_manual(values = c("KO" = "red", "WT" = "black", "n.s." = "grey")) + -->
+<!--   theme_classic() -->
+
+<!-- ggplot(plt_df, -->
+<!--        aes(x = logFC, y = -log10(PValue), color = direction)) + -->
+<!--   geom_point() + -->
+<!--   geom_text_repel(aes(label = label), show.legend = FALSE) + -->
+<!--   scale_color_manual(values = c("KO" = "red", "WT" = "black", "n.s." = "grey")) + -->
+<!--   theme_classic() -->
+<!-- dev.off() -->
+
+<!-- # lfit <- glmQLFit(dge, design = design_mtx, dispersion = dge$trended.dispersion) -->
+<!-- # lrt <- glmQLFTest(lfit, coef = "genotypeKO") -->
+<!-- # res <- topTags(lrt, n = Inf) -->
+<!-- #  -->
+<!-- # thresh_padj <- 0.05 -->
+<!-- # ggplot(res$table, aes(x = logCPM, y = logFC, color = FDR < thresh_padj)) + -->
+<!-- #   geom_point() + -->
+<!-- #   scale_color_manual(values = c("TRUE" = "red", "FALSE" = "black"), na.value = "grey") + -->
+<!-- #   theme_classic() -->
+<!-- #  -->
+<!-- # ggplot(res$table, -->
+<!-- #        aes(x = logFC, y = -log10(PValue), color = FDR < thresh_padj)) + -->
+<!-- #   geom_point() + -->
+<!-- #   scale_color_manual(values = c("TRUE" = "red", "FALSE" = "black"), na.value = "grey") + -->
+<!-- #   theme_classic() -->
+<!-- ``` -->
+
+
+<!-- ```{r} -->
+<!-- library(enrichR) -->
+
+<!-- # listEnrichrDbs() %>% View() -->
+<!-- dbs <- c("GO_Molecular_Function_2023", "GO_Cellular_Component_2023", "GO_Biological_Process_2023", "KEGG_2019_Mouse", "MSigDB_Oncogenic_Signatures", "MSigDB_Computational", "MSigDB_Hallmark_2020") -->
+
+<!-- up_ko <- plt_df$gene[plt_df$direction == "KO"] -->
+<!-- up_wt <- plt_df$gene[plt_df$direction == "WT"] -->
+<!-- enriched_ko <- enrichr(up_ko, dbs) -->
+<!-- enriched_wt <- enrichr(up_wt, dbs) -->
+
+<!-- pdf("enrichr.pdf", width = 20, height = 10) -->
+<!-- for (i in names(enriched_ko)) { -->
+<!--   p1 <- plotEnrich(enriched_ko[[i]], showTerms = 50, numChar = 50, y = "Count", orderBy = "P.value") + labs(subtitle = i, title = "Up in KO") -->
+<!--   p2 <- plotEnrich(enriched_wt[[i]], showTerms = 50, numChar = 50, y = "Count", orderBy = "P.value") + labs(subtitle = i, title = "Down in KO") -->
+<!--   gridExtra::grid.arrange(p1, p2, nrow = 1) -->
+<!-- } -->
+<!-- dev.off() -->
+
+<!-- saveRDS(enriched_ko, "enrichr_ko.rds") -->
+<!-- saveRDS(enriched_wt, "enrichr_wt.rds") -->
+
+<!-- library(openxlsx) -->
+<!-- wb <- createWorkbook() -->
+<!-- sapply(names(enriched_ko), function(x) { -->
+<!--   addWorksheet(wb, x) -->
+<!--   writeData(wb, x, enriched_ko[[x]]) -->
+<!-- }) -->
+<!-- saveWorkbook(wb, "enrichr_up_ko.xlsx") -->
+
+<!-- library(openxlsx) -->
+<!-- wb <- createWorkbook() -->
+<!-- sapply(names(enriched_wt), function(x) { -->
+<!--   addWorksheet(wb, x) -->
+<!--   writeData(wb, x, enriched_wt[[x]]) -->
+<!-- }) -->
+<!-- saveWorkbook(wb, "enrichr_down_ko.xlsx") -->
+
+<!-- ``` -->

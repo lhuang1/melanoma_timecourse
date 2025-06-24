@@ -1,0 +1,219 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+
+```{r config, echo=FALSE, message=FALSE}
+rm(list = ls())
+suppressPackageStartupMessages({
+  library(tidyverse)
+  library(openxlsx)
+  library(stringr)
+  
+  library(Seurat)
+  
+  library(RColorBrewer)
+  library(gridExtra)
+  library(cowplot)
+  library(ggbeeswarm)
+  library(ggsignif)
+  library(ComplexHeatmap)
+  library(circlize)
+})
+source("utils.R")
+
+```
+
+load data
+```{r}
+so_T <- readRDS("../../data/scRNAseq_10x/seuratObject_T_cells.rds")
+so_nT <- readRDS("../../data/scRNAseq_10x/seuratObject_non_T_cells.rds")
+```
+
+
+## 3A. expression of Penk in T_4 or T_7 vs. time or size.
+```{r}
+plt_df <- so_T@meta.data %>% 
+  select(cluster_name, cluster_annotation, tumor_size, time_point, mouse_id) %>% 
+  mutate(expr = as.numeric(so_T[["RNA"]]@data["Penk",])) %>% 
+  filter(cluster_name %in% c("T4", "T7")) %>% 
+  group_by(cluster_name, cluster_annotation, tumor_size, time_point, mouse_id) %>% 
+  summarise(avg_expr = mean(expr))
+
+range(plt_df$avg_expr)
+
+df_time_size <- readRDS("../Fig2/edgeR_time_size_all_2020-12-30.rds")
+df_time_size %>% 
+  filter(Cluster %in% c("T_4", "T_7"), Gene == "Penk")
+
+p_size <- ggplot(plt_df, aes(x = tumor_size, y = avg_expr)) +
+  geom_point() +
+  geom_smooth(method = "lm") +
+  facet_wrap(~cluster_annotation, scales = "free", nrow = 1) +
+  scale_x_log10(limits = c(20, 300)) +
+  # scale_y_continuous(limits = c(0, 0.65)) +
+  # labs(x = "Size", y = "Percent of cells") +
+  labs(x = "Size", y = "Expression") +
+  theme_classic() +
+  theme(strip.background = element_blank(),
+        strip.text = element_text(size = 10, face = "bold"))
+
+p_time <- ggplot(plt_df, aes(x = time_point, y = avg_expr)) +
+  geom_point() +
+  geom_smooth(method = "lm") +
+  facet_wrap(~cluster_annotation, scales = "free", ncol = 4) +
+  # scale_x_log10(limits = c(20, 300)) +
+  # scale_y_continuous(limits = c(0, 35)) +
+  labs(x = "Time", y = "Expression") +
+  theme_classic() +
+  theme(strip.background = element_blank(),
+        strip.text = element_text(size = 10, face = "bold"))
+
+library(cowplot)
+pdf(paste0("3A_scatter_Penk_vs_time_size_in_T4_T7_", Sys.Date(), ".pdf"), width = 5, height = 3.5)
+plot_grid(p_size, p_time, ncol = 1)
+dev.off()
+
+```
+
+
+
+## S3A. dotplot Penk cleavage machinery expression in CD8+ clusters.
+```{r}
+gene_vec <- c("Cpe", "Cpd", "Rnpep", "Furin", "Ctsl", "Pcsk1")
+cd8 <- readRDS("../../timecourse_sc_RNAseq_10x/2_CD8_focused/cd8.rds")
+
+
+cd8_cluster_vec <- c("T3", "T0", "T1", "T7", "T4", "T9")
+color_cluster_annotation_cd8 <- color_cluster_annotation_T[match(cd8_cluster_vec, names(color_cluster_T))]
+cd8$cluster_annotation <- factor(cd8$cluster_annotation, levels = names(color_cluster_annotation_cd8))
+
+library(Matrix)
+plt_df <- data.frame(
+  cluster = cd8$cluster_annotation,
+  t(cd8[["RNA"]]$data[intersect(gene_vec, rownames(cd8)),])
+) %>% 
+  gather(key = "gene_name", value = "expr", -cluster) %>% 
+  group_by(cluster, gene_name) %>% 
+  summarise(avg_expr = mean(expr),
+         pct_expr = 100 * mean(expr > 0)) %>% 
+  group_by(gene_name) %>% 
+  mutate(avg_expr_z = scale(avg_expr)) %>% 
+  ungroup() %>% 
+  mutate(#gene_name = factor(gene_name, levels = (markers_T$gene_name)),
+         cluster = factor(cluster, levels = levels(cd8$cluster_annotation) %>% rev))
+
+p <- ggplot(plt_df, aes(x = gene_name, y = cluster, size = pct_expr, fill = avg_expr_z)) +
+  geom_point(shape = 21) +
+  scale_fill_gradientn(colors = brewer.pal(11, "RdBu") %>% rev) +
+  scale_size(range = c(0, 9)) +
+  theme_classic() +
+  labs(x = "", y = "", size = "Percent expressed", fill = "Z-normalized\naverage expression") +
+  # facet_grid(~gene_cluster, scales = "free", space = "free") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        strip.background = element_blank(),
+        strip.text = element_blank())
+
+
+
+## save to pdf
+pdf(file = paste0("S3A_dotplot_cleavage_", Sys.Date(), ".pdf"), width = 5, height = 4)
+p
+dev.off()
+
+```
+
+
+## S3B. UMAP Ogfr expression in all clusters.
+```{r}
+p_T <- so_T@meta.data %>% 
+  select(UMAP_1, UMAP_2) %>% 
+  mutate(value = so_T[["RNA"]]@data["Ogfr",]) %>% 
+  arrange(value) %>% 
+  ggplot() +
+  geom_point(aes(x = UMAP_1, y = UMAP_2, color = value), size = 0.01) +
+  scale_color_gradientn(colors = brewer.pal(9, "Blues")[-1]) +
+  labs(color = "Expression", title = "T cells") +
+  theme(plot.title = element_text(size = 10, hjust = 0.5, face = "bold"),
+      axis.title = element_text(size = 8),
+      axis.text = element_blank(),
+      axis.ticks = element_blank(),
+      legend.text = element_text(size = 8),
+      legend.title = element_text(size = 8),
+      legend.key.width = unit(0.1, "in"),
+      legend.key.height = unit(0.1, "in"),
+      panel.background = element_blank()) +
+  SeuratExtend::theme_umap_arrows()
+
+
+p_nT <- so_nT@meta.data %>% 
+  select(UMAP_1, UMAP_2) %>% 
+  mutate(value = so_nT[["RNA"]]@data["Ogfr",]) %>% 
+  arrange(value) %>% 
+  ggplot() +
+  geom_point(aes(x = UMAP_1, y = UMAP_2, color = value), size = 0.01) +
+  scale_color_gradientn(colors = brewer.pal(9, "Blues")[-1]) +
+  labs(color = "Expression", title = "Non-T cells") +
+  theme(plot.title = element_text(size = 10, hjust = 0.5, face = "bold"),
+      axis.title = element_text(size = 8),
+      axis.text = element_blank(),
+      axis.ticks = element_blank(),
+      legend.text = element_text(size = 8),
+      legend.title = element_text(size = 8),
+      legend.key.width = unit(0.1, "in"),
+      legend.key.height = unit(0.1, "in"),
+      panel.background = element_blank()) +
+  SeuratExtend::theme_umap_arrows()
+
+
+pdf(paste0("S3B_UMAP_Ogfr_", Sys.Date(), ".pdf"), width = 4, height = 2.5)
+p_T
+p_nT
+dev.off()
+```
+
+## 3B. Dysfunction signature scores in Penk+/- x Ogfr+/- subsets.
+
+```{r}
+colnames(cd8@meta.data)
+plt_df <- data.frame(
+  cluster_name = cd8$cluster_name,
+  penk = cd8[["RNA"]]@data["Penk",] %>% as.numeric(),
+  ogfr = cd8[["RNA"]]@data["Ogfr",] %>% as.numeric(),
+  sigscore = cd8@meta.data[,"Terminally exhausted vs. Progenitor (Tumor, bulk)"]
+  # sigscore = cd8@meta.data[,"Dysfunctional CD8"]
+) %>% 
+  filter(cluster_name %in% c("T1", "T7", "T4")) %>%
+  # filter(cluster_name %in% c("T4")) %>%
+  mutate(group = ifelse(penk > 0,
+                        ifelse(ogfr > 0, "Penk+ Ogfr+", "Penk+ Ogfr-"),
+                        ifelse(ogfr > 0, "Penk- Ogfr+", "Penk- Ogfr-")) %>% factor(levels = c("Penk- Ogfr-", "Penk+ Ogfr-", "Penk- Ogfr+", "Penk+ Ogfr+")))
+
+library(ggbeeswarm)
+color_group <- c("Penk- Ogfr-" = "#1F78B4", "Penk+ Ogfr-" = "#FDBF6F", "Penk- Ogfr+" = "#33A02C", "Penk+ Ogfr+" = "#E31A1C")
+
+p <- ggplot(plt_df, aes(x = group, y = sigscore, color = group)) +
+  geom_quasirandom(size = 0.5) +
+  # geom_violin() +
+  geom_boxplot(outliers = FALSE, fill = "white", color = "grey40", width = 0.1) +
+  geom_hline(yintercept = median(plt_df$sigscore[plt_df$group == "Penk+ Ogfr+"]), linetype = 2, color = "black") +
+  # coord_fixed(ratio = 6) +
+  geom_signif(comparisons = list(c("Penk+ Ogfr+", "Penk- Ogfr+"), c("Penk+ Ogfr+", "Penk+ Ogfr-"), c("Penk+ Ogfr+", "Penk- Ogfr-")),
+              step_increase = 0.08, color = "black", test = "wilcox.test") +
+  scale_color_manual(values = color_group) +
+  labs(x = "", y = "Terminal dysfunction\nsignature score") +
+  theme_classic() +
+  theme(legend.position = "none", plot.margin = margin(t = 0.1, r = 0.1, l = 0.1, b = 0.01, unit = 'in'),
+        # plot.title = element_text(hjust = 0.5, face = "bold", size = 16),
+        axis.text.x = element_text(angle = 45, hjust = 1, color = "black", size = 12),
+        axis.text.y = element_text(color = "black", size = 12),
+        axis.title = element_text(color = "black", size = 14))
+
+pdf(paste0("3B_violin_dysfunction_signature_by_penk_ogfr_T147_", Sys.Date(), ".pdf"), width = 4, height = 4)
+p
+dev.off()
+
+```
+
+

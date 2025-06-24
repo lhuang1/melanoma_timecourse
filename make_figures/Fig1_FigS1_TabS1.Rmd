@@ -1,0 +1,676 @@
+---
+title: "Figure 1: characterization of clusters"
+output: html_notebook
+---
+
+
+```{r config, echo=FALSE, message=FALSE}
+rm(list = ls())
+suppressPackageStartupMessages({
+  library(Seurat)
+  library(tidyverse)
+  library(openxlsx)
+  library(stringr)
+  library(RColorBrewer)
+  library(gridExtra)
+  library(cowplot)
+  library(ggbeeswarm)
+  library(ggsignif)
+  library(ComplexHeatmap)
+  library(circlize)
+})
+source("utils.R")
+
+```
+
+load data
+```{r}
+so_T <- readRDS("../../data/scRNAseq_10x/seuratObject_T_cells.rds")
+so_nT <- readRDS("../../data/scRNAseq_10x/seuratObject_non_T_cells.rds")
+```
+
+
+
+## A. cartoon of study (Ania)
+
+
+## B. data overview: time of sac vs. tumor size
+
+```{r}
+plt_df <- so_T@meta.data %>% 
+  group_by(time_point, tumor_size, sample_num_new) %>% 
+  tally(name = "n_cells")
+lfit <- lm(tumor_size ~ time_point, data = plt_df)
+lsum <- summary(lfit)
+lsum$r.squared
+
+cor(plt_df$time_point, plt_df$tumor_size, method = "spearman")
+# [1] 0.8562886
+
+p <- ggplot(plt_df, aes(x = time_point, y = tumor_size)) +
+  # geom_smooth(method = "lm", formula = y ~ x, size = 0.5, linetype = 2, se = T) +
+  geom_smooth(method = 'loess', formula = 'y ~ x', size = 0.5, linetype = 2, se = F) +
+  geom_jitter(shape = 21, fill = "black", width = 0.1) +
+  annotate("label", x = 10, y = 280, label = expression(paste("Spearman ", rho, "=0.86")), size = 4) +
+  labs(x = "Time (days)", y = expression(paste("Tumor size (", mm^{2}, ")"))) +
+  scale_x_continuous(breaks = c(9, 10, 11, 12, 13, 14, 15, 16)) +
+  # scale_y_log10() +
+  theme_classic() +
+  theme(axis.title = element_text(size = 14, colour = "black"),
+        axis.text = element_text(size = 12, colour = "black"))
+set.seed(121)
+pdf(paste0("B_scatter_size_vs_time_", Sys.Date(), ".pdf"), width = 5, height = 3)
+p
+dev.off()
+```
+
+
+
+## C. T cell clusters
+UMAP of T cell clusters.
+
+```{r}
+## UMAP of clusters
+center_df <- so_T@meta.data %>% 
+  group_by(cluster_annotation, louvain) %>%
+  summarise(center_x = mean(UMAP_1), 
+            center_y = mean(UMAP_2)) %>% 
+  mutate(label = louvain)
+
+order_cluster_T <- sub("\\..*", "", names(color_cluster_annotation_T)) %>% sub("^.*T", "", .) %>% as.integer() %>% order()
+
+p1 <- so_T@meta.data %>% 
+  mutate(cluster_annotation = factor(cluster_annotation, levels = names(color_cluster_annotation_T)[order_cluster_T])) %>% 
+  ggplot() +
+  geom_point(aes(x = UMAP_1, y = UMAP_2, color = cluster_annotation), size = 0.01) +
+  geom_label(data = center_df, aes(x = center_x, y = center_y, label = label), 
+             size = 3, vjust = .5, fontface = "bold", lineheight = 0.8, fill = "white", alpha = 0.8, label.size = NA) +
+  scale_color_manual(values = color_cluster_annotation_T) +
+  labs(color = "", title = "T Cell Clusters") +
+  guides(color = guide_legend(override.aes = list(size = 3))) +
+  theme(plot.title = element_text(size = 10, hjust = 0.5, face = "bold"),
+        axis.title = element_text(size = 8),
+        axis.text = element_blank(),
+        axis.ticks = element_blank(),
+        legend.text = element_text(size = 8),
+        legend.key.height = unit(0.1, "in"),
+        panel.background = element_blank(),
+        panel.border = element_rect(color = "black", fill = NA))
+legend <- get_plot_component(p1, 'guide-box-right', return_all = TRUE)
+
+pdf(paste0("C_UMAP_T_clusters_", Sys.Date(), ".pdf"), width = 4, height = 3)
+p1 + theme(legend.position = "none")
+ggdraw(legend)
+dev.off()
+```
+
+
+## D. Dotplot to show the expression (z-score) of marker genes that Davide selected to annotate the T cell clusters.
+
+```{r}
+## read and process cluster markers
+m_T <- readWorkbook(wb, sheet = "T_markers_parsed")
+setdiff(m_T$gene, rownames(so_T))
+markers_T <- m_T %>% 
+  filter(!duplicated(gene)) %>% 
+  filter(gene %in% rownames(so_T)) %>% 
+  mutate(cluster = factor(cluster, levels = unique(m_T$cluster)))
+# check if all markers are present in the dataset
+
+library(Matrix)
+plt_df <- data.frame(
+  cluster = so_T$cluster_name,
+  t(so_T[["RNA"]]$data[markers_T$gene,])
+) %>% gather(key = "gene", value = "expr", -cluster) %>% 
+  group_by(cluster, gene) %>% 
+  summarise(avg_expr = mean(expr),
+         pct_expr = 100 * mean(expr > 0)) %>% 
+  group_by(gene) %>% 
+  mutate(avg_expr_z = scale(avg_expr)) %>% 
+  ungroup() %>% 
+  mutate(gene = factor(gene, levels = (markers_T$gene)),
+         cluster = factor(cluster, levels = levels(so_T$cluster_name) %>% rev),
+         gene_cluster = markers_T$cluster[match(gene, markers_T$gene)] %>% factor(levels = rev(levels(cluster))))
+
+p_T <- ggplot(plt_df, aes(x = gene, y = cluster, size = pct_expr, fill = avg_expr_z)) +
+  geom_point(shape = 21) +
+  scale_fill_gradientn(colors = brewer.pal(11, "RdBu") %>% rev) +
+  scale_size(range = c(0, 6)) +
+  scale_y_discrete(labels = levels(so_T$cluster_name) %>% rev) +
+  theme_classic() +
+  labs(x = "", y = "", size = "Percent expressed", fill = "Z-normalized\naverage expression") +
+  facet_grid(~gene_cluster, scales = "free", space = "free") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1, color = "black", face = "italic"),
+        axis.text.y = element_text(color = "black", size = 12),
+        strip.background = element_blank(),
+        strip.text = element_blank())
+  
+p_T
+
+
+
+## save to pdf
+pdf(file = paste0("D_dotplot_T_cluster_markers_", Sys.Date(), ".pdf"), width = 9, height = 5)
+p_T
+dev.off()
+```
+
+
+
+
+
+## E. Non-T cell clusters
+UMAP of non-T cell clusters
+```{r}
+## UMAP of clusters
+center_df <- so_nT@meta.data %>% 
+  group_by(annotation, louvain) %>%
+  summarise(center_x = mean(UMAP_1), 
+            center_y = mean(UMAP_2)) %>% 
+  mutate(label = louvain)
+center_df$center_x[center_df$louvain == 12] <- -1.3
+
+order_cluster_nT <- sub("\\..*", "", names(color_cluster_annotation_nT)) %>% sub("^.*T", "", .) %>% as.integer() %>% order()
+p1 <- so_nT@meta.data %>% 
+  mutate(cluster_annotation = factor(cluster_annotation, levels = names(color_cluster_annotation_nT)[order_cluster_nT])) %>% 
+  ggplot() +
+  geom_point(aes(x = UMAP_1, y = UMAP_2, color = cluster_annotation), size = 0.01) +
+  geom_label(data = center_df, aes(x = center_x, y = center_y, label = label), 
+             size = 3, vjust = .5, fontface = "bold", lineheight = 0.8, fill = "white", alpha = 0.8, label.size = NA) +
+  scale_color_manual(values = color_cluster_annotation_nT) +
+  labs(color = "", title = "Non-T Cell Clusters") +
+  guides(color = guide_legend(override.aes = list(size = 3))) +
+  theme(plot.title = element_text(size = 10, hjust = 0.5, face = "bold"),
+        axis.title = element_text(size = 8),
+        axis.text = element_blank(),
+        axis.ticks = element_blank(),
+        legend.text = element_text(size = 8),
+        legend.key.height = unit(0.1, "in"),
+        panel.background = element_blank(),
+        panel.border = element_rect(color = "black", fill = NA))
+legend <- get_plot_component(p1, 'guide-box-right', return_all = TRUE)
+
+pdf(paste0( "E_UMAP_Non-T_clusters_", Sys.Date(), ".pdf"), width = 4, height = 3)
+p1 + theme(legend.position = "none")
+ggdraw(legend)
+dev.off()
+
+```
+
+
+<!-- Heatmaps to show the expression (z-score) of marker genes that Davide selected to annotate the non-T cell clusters. -->
+
+<!-- ```{r} -->
+<!-- ## read and process cluster markers -->
+<!-- m_nT <- readWorkbook(wb, sheet = "nonT_markers") -->
+<!-- markers_nT <- gather(m_nT, key = "cluster", value = "gene") %>%  -->
+<!--   filter(gene != "" & !is.na(gene)) %>% -->
+<!--   mutate(cluster = factor(cluster, levels = ann_nT$cluster)) %>%  -->
+<!--   arrange(cluster) %>%  -->
+<!--   filter(!duplicated(gene)) -->
+<!-- # parse gene names to match the seurat object -->
+<!-- markers_nT$gene <- rownames(so_nT)[match(toupper(markers_nT$gene), toupper(rownames(so_nT)))] -->
+<!-- # check if all markers are present in the dataset -->
+<!-- stopifnot(!any(is.na(markers_nT$gene))) -->
+
+<!-- color_cluster_a_nT <- color_cluster_nT %>% `names<-`(., value = ann_nT$annotation) -->
+<!-- p_nT <- DoHeatmap(so_nT, features = markers_nT$gene,  -->
+<!--                  group.by = "annotation",  -->
+<!--                  group.colors = color_cluster_a_nT, -->
+<!--                  size = 3, raster = TRUE, angle = 60) + -->
+<!--   scale_fill_gradient2(low = "magenta", mid = "black", high = "yellow", breaks = seq(-2.5, 2.5, length.out = 5)) + -->
+<!--   guides(color = FALSE) + -->
+<!--   theme(axis.text.y = element_text(size = 9), -->
+<!--         plot.margin = unit(c(1.5,0,0,0), "cm")) -->
+
+<!-- ## save to pdf -->
+<!-- pdf(file = paste0(dir_out, "D_heatmap_Non-T_cluster_markers_", today, ".pdf"), width = 8, height = 9) -->
+<!-- p_nT -->
+<!-- dev.off() -->
+<!-- ``` -->
+
+
+## F. Dotplot to show the expression (z-score) of marker genes that Davide selected to annotate the T cell clusters.
+
+```{r}
+## read and process cluster markers
+m_nT <- readWorkbook(wb, sheet = "nonT_markers_parsed")
+setdiff(m_nT$gene, rownames(so_nT)) %>% cat(sep = '\n')
+markers_nT <- m_nT %>% 
+  filter(!duplicated(gene)) %>% 
+  filter(gene %in% rownames(so_nT)) %>% 
+  mutate(cluster = factor(cluster, levels = unique(m_nT$cluster)))
+
+
+library(Matrix)
+plt_df <- data.frame(
+  cluster = so_nT$cluster_name,
+  t(so_nT[["RNA"]]$data[markers_nT$gene,]),
+  check.names = FALSE
+) %>% 
+  filter(cluster != "Non-T12") %>% 
+  gather(key = "gene", value = "expr", -cluster) %>% 
+  group_by(cluster, gene) %>% 
+  summarise(avg_expr = mean(expr),
+         pct_expr = 100 * mean(expr > 0)) %>% 
+  group_by(gene) %>% 
+  mutate(avg_expr_z = scale(avg_expr)) %>% 
+  ungroup() %>% 
+  mutate(gene = factor(gene, levels = (markers_nT$gene)),
+         cluster = factor(cluster, levels = levels(so_nT$cluster_name) %>% rev),
+         gene_cluster = markers_nT$cluster[match(gene, markers_nT$gene)] %>% factor(levels = rev(levels(cluster))))
+
+p_nT <- ggplot(plt_df, aes(x = gene, y = cluster, size = pct_expr, fill = avg_expr_z)) +
+  geom_point(shape = 21) +
+  scale_fill_gradientn(colors = brewer.pal(11, "RdBu") %>% rev) +
+  scale_size(range = c(0, 6)) +
+  # scale_y_discrete(labels = levels(so_nT$cluster_name) %>% rev) +
+  theme_classic() +
+  labs(x = "", y = "", size = "Percent expressed", fill = "Z-normalized\naverage expression") +
+  facet_grid(~gene_cluster, scales = "free", space = "free") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1, color = "black", face = "italic"),
+        axis.text.y = element_text(color = "black", size = 12),
+        strip.background = element_blank(),
+        strip.text = element_blank())
+  
+p_nT
+
+
+
+## save to pdf
+pdf(file = paste0("F_dotplot_nT_cluster_markers_", Sys.Date(), ".pdf"), width = 12, height = 5)
+p_nT
+dev.off()
+```
+
+
+## G. CD8 cluster trajectory
+
+```{r}
+cd8 <- readRDS("../../timecourse_sc_RNAseq_10x/2_CD8_focused/cd8.rds")
+cd8_cluster_vec <- c("T3", "T0", "T1", "T7", "T4", "T9")
+color_cluster_annotation_cd8 <- color_cluster_annotation_T[match(cd8_cluster_vec, names(color_cluster_T))]
+cd8$cluster_annotation <- factor(cd8$cluster_annotation, levels = names(color_cluster_annotation_cd8))
+
+
+lineage <- readRDS("../../timecourse_sc_RNAseq_10x/2_CD8_focused/slingshot_lineages.rds")
+# sce <- readRDS("../../timecourse_sc_RNAseq_10x/2_CD8_focused/cd8_slingshot_sce.rds")
+# tmp <- SlingshotDataSet(sce)
+# tmp@adjacency
+
+center_df <- data.frame(cd8@meta.data %>% select(annotation), cd8@reductions$umap@cell.embeddings) %>% 
+  group_by(annotation) %>%
+  summarise(center_x = mean(umap_1), 
+            center_y = mean(umap_2))
+lineage_df_ls <- lapply(lineage, function(x) {
+  center_df %>% filter(annotation %in% x) %>% mutate(annotation = factor(annotation, levels = x)) %>% arrange(annotation)
+})
+
+
+
+p1 <- DimPlot(cd8, group.by = "cluster_annotation", reduction = "umap", label = FALSE) +
+  geom_point(data = center_df, mapping = aes(x = center_x, y = center_y), size = 3) +
+  geom_path(data = lineage_df_ls$Lineage1, mapping = aes(x = center_x, y = center_y), linewidth = 0.5) +
+  geom_path(data = lineage_df_ls$Lineage2, mapping = aes(x = center_x, y = center_y), linewidth = 0.5) +
+  scale_color_manual(values = color_cluster_annotation_cd8) +
+  labs(color = "", title = "T Cell Clusters", x = "UMAP_1", y = "UMAP_2") +
+  guides(color = guide_legend(override.aes = list(size = 3))) +
+  theme(plot.title = element_text(size = 10, hjust = 0.5, face = "bold"),
+        axis.title = element_text(size = 8),
+        axis.text = element_blank(),
+        axis.ticks = element_blank(),
+        legend.text = element_text(size = 8),
+        legend.key.height = unit(0.1, "in"),
+        panel.background = element_blank(),
+        panel.border = element_rect(color = "black", fill = NA))
+legend <- get_plot_component(p1, 'guide-box-right', return_all = TRUE)
+
+pdf(paste0( "G_CD8_trajectory_", Sys.Date(), ".pdf"), width = 4, height = 3)
+p1 + theme(legend.position = "none")
+ggdraw(legend)
+dev.off()
+
+```
+
+
+
+## H. UMAP and violin plots of CD8 signatures.
+```{r}
+sigs_to_plot <- c("Progenitor vs. terminally exhausted (Tumor, bulk)" = "Stem-like signature", 
+                  "Short-lived effectors signature" = "Short-lived effectors signature",
+                  "Terminally exhausted vs. Progenitor (Tumor, bulk)" = "Terminal dysfunction signature", 
+                  "Non_responder" = "Non-responder to ICB signature")
+plist_umap <- list()
+plist_vln <- list()
+for (x in names(sigs_to_plot)) {
+  plt_df <- data.frame(UMAP_1 = cd8@reductions$umap@cell.embeddings[,1],
+                       UMAP_2 = cd8@reductions$umap@cell.embeddings[,2],
+                       sigscore = cd8@meta.data[,x],
+                       cluster_name = cd8$cluster_name %>% factor(levels = cd8_cluster_vec), 
+                       annotation = cd8$annotation) %>% 
+    mutate(sigscore_cap = pmax(sigscore, quantile(sigscore, 0.05)) %>% pmin(., quantile(sigscore, 0.95))) %>% 
+    arrange(sigscore_cap)
+  lmt <- ceiling(10*max(abs(range(plt_df$sigscore_cap))))/10
+  plist_umap[[x]] <- ggplot(plt_df, aes(x = UMAP_1, y = UMAP_2, color = sigscore_cap)) +
+    geom_point(size = 0.5) +
+    coord_fixed() +
+    # scale_color_gradientn(colors = c("#22578B", "#73A9D2", "white", "#FDB393", "#b22222"), limits = c(-lmt, lmt)) +
+    scale_color_gradientn(colors = c("#22578B", "#73A9D2", "white", "#FDB393", "#b22222")) +
+    labs(color = "Signature score") +
+    theme_classic() +
+    theme(axis.text = element_blank(),
+        axis.ticks = element_blank(),
+        panel.background = element_blank(),
+        panel.border = element_rect(color = "black", fill = NA))
+  
+  if (x == "Progenitor vs. terminally exhausted (Tumor, bulk)") {
+    comparisons_ls <- list(c("T7", "T1"), c("T7", "T0"), c("T7", "T3"))
+    step_increase <- 0.08
+  } else if (x == "Short-lived effectors signature") {
+    comparisons_ls <- list(c("T0", "T1"), c("T7", "T1"), c("T4", "T7"), c("T3", "T1"), c("T4", "T1"))
+    step_increase <- c(0, 0.08, 0.08, 0.08, 0.08)
+  } else if (x == "Terminally exhausted vs. Progenitor (Tumor, bulk)") {
+    comparisons_ls <- list(c("T7", "T4"), c("T1", "T4"))
+    step_increase <- 0.08
+  } else if (x == "Non_responder") {
+    comparisons_ls <- list(c("T4", "T9"), c("T4", "T7"), c("T1", "T4"))
+    step_increase <- 0.08
+  } else {
+    stop("ERROR: Invalid signature name!")
+  }
+  
+  
+  plist_vln[[x]] <- ggplot(plt_df, aes(x = cluster_name, y = sigscore, color = cluster_name)) +
+    geom_quasirandom(size = 0.5) +
+    geom_boxplot(outliers = FALSE, fill = NA, color = "black", width = 0.1) +
+    # coord_fixed(ratio = 6) +
+    geom_signif(comparisons = comparisons_ls,
+                step_increase = step_increase, color = "black", textsize = 2.8) +
+    scale_color_manual(values = color_cluster_T) +
+    labs(x = "", y = "Signature score") +
+    theme_classic() +
+    theme(legend.position = "none", plot.margin = margin(t = 0.1, r = 0.1, l = 0.1, b = 0.01, unit = 'in'),
+          # plot.title = element_text(hjust = 0.5, face = "bold", size = 16),
+          axis.text.x = element_text(angle = 0, hjust = 0.5, color = "black", size = 12),
+          axis.text.y = element_text(color = "black", size = 12),
+          axis.title = element_text(color = "black", size = 14))
+}
+
+pdf(paste0("H_UMAP_violin_CD8_signatures_", Sys.Date(), ".pdf"), width = 10, height = 4)
+for (i in names(plist_umap)) {
+  grid.arrange(plist_umap[[i]], plist_vln[[i]], nrow = 1, widths = c(1, 0.4), top = textGrob(sigs_to_plot[i], gp = gpar(fontsize = 14)))
+}
+dev.off()
+```
+
+
+
+## I. TCR analysis
+
+See TCR.Rmd
+
+
+```{r}
+meta_plate <- readRDS("../../timecourse_sc_RNAseq_smartseq2/meta_cd4_cd8_clonotype_2021-08-27.rds")
+meta_sub <- meta_plate %>% 
+  mutate(annotation = factor(names(color_annotation_T)[match(paste0("T", meta_plate$predicted.id), names(color_cluster_T))], levels = names(color_annotation_T))) %>% 
+  filter(!is.na(clonotype_id), clone_size >= 3) %>% 
+  arrange(-clone_size)
+tab <- table(meta_sub$clonotype_id, meta_sub$annotation) 
+pct <- (tab/rowSums(tab)*100) %>% as.data.frame() %>% spread(key = Var2, value = Freq) %>% column_to_rownames(var = "Var1")
+
+idx_row <- do.call(order, -cbind(pct, rowSums(pct>0)))
+plt_df_total <- data.frame(Total = rowSums(tab)[idx_row])
+plt_mtx_pct <- pct[idx_row,]
+
+df_annot_col <- data.frame(
+  cluster = names(color_annotation_T)
+) %>% `rownames<-`(., value = colnames(pct))
+# color_annotation_T_ss2 <- color_annotation_T
+# names(color_annotation_T_ss2) <- df_annot_col$cluster
+
+annot_col <- columnAnnotation(cluster = df_annot_col$cluster, 
+                              col = list(cluster = color_annotation_T),
+                              show_legend = c("col" = FALSE), 
+                              gp = gpar(fontsize = 9))
+
+annot_row <- rowAnnotation(`Number\nof cells` = anno_barplot(plt_df_total$Total, axis_param = list(direction = "reverse"), border = TRUE),
+                           width = unit(0.8, "in"), gp = gpar(fontsize = 9))
+
+hm <-Heatmap(plt_mtx_pct,
+  name = "Percent\nof cells",
+  col = colorRamp2(breaks = seq(0, 100, length.out = 100), colors = colorRampPalette(c("white", "red"))(100)),
+  cluster_rows = FALSE,
+  cluster_columns = FALSE,
+  show_row_names = FALSE,
+  show_column_names = TRUE,
+  column_names_side = "top",
+  column_names_rot = 45,
+  column_names_gp = gpar(fontsize = 9), 
+  border = TRUE, 
+  rect_gp = gpar(col = "grey", lwd = 0.01),
+  top_annotation = annot_col,
+  left_annotation = annot_row)
+
+
+pdf(paste0("I_heatmap_clonotype_share_by_clusters_", Sys.Date(), ".pdf"), width = 4, height = 6)
+draw(hm)
+dev.off()
+
+
+```
+
+
+## S1A. UMAP color by time points and tumor sizes for T cells (related to Fig 1C)
+```{r}
+idx_shuffle_t <- sample(1:ncol(so_T), ncol(so_T), replace = FALSE)
+## UMAP of clusters
+p_t_time <- so_T@meta.data[idx_shuffle_t,] %>% 
+  ggplot() +
+  geom_point(aes(x = UMAP_1, y = UMAP_2, color = time_point), size = 0.01) +
+  # scale_color_viridis_c(option = "D") +
+  scale_color_gradientn(colors = brewer.pal(9, "BuPu")) +
+  labs(color = "Time (days)") +
+  coord_fixed() +
+  # guides(color = guide_legend(override.aes = list(size = 3))) +
+  theme(plot.title = element_text(size = 10, hjust = 0.5, face = "bold"),
+        axis.title = element_text(size = 8),
+        axis.text = element_blank(),
+        axis.ticks = element_blank(),
+        legend.text = element_text(size = 8),
+        legend.key.height = unit(0.1, "in"),
+        panel.background = element_blank())
+# legend1 <- get_plot_component(p1, 'guide-box-right', return_all = TRUE)
+
+p_t_size <-
+  so_T@meta.data[idx_shuffle_t,] %>% 
+  ggplot() +
+  geom_point(aes(x = UMAP_1, y = UMAP_2, color = tumor_size), size = 0.01) +
+  scale_color_gradientn(colors = brewer.pal(9, "OrRd")) +
+  # scale_color_viridis_c(option = "B") +
+  labs(color = "Tumor size (mm2)") +
+  coord_fixed() +
+  # guides(color = guide_legend(override.aes = list(size = 3))) +
+  theme(plot.title = element_text(size = 10, hjust = 0.5, face = "bold"),
+        axis.title = element_text(size = 8),
+        axis.text = element_blank(),
+        axis.ticks = element_blank(),
+        legend.text = element_text(size = 8),
+        legend.key.height = unit(0.1, "in"),
+        panel.background = element_blank())
+
+pdf(paste0("S1A_UMAP_by_time_size_T_", Sys.Date(), ".pdf"), width = 5, height = 3)
+p_t_time
+p_t_size
+dev.off()
+```
+
+
+## S1B. UMAP color by time points and tumor sizes for non-T cells (related to Fig 1E)
+```{r}
+idx_shuffle_nt <- sample(1:ncol(so_nT), ncol(so_nT), replace = FALSE)
+p_nt_time <- so_nT@meta.data[idx_shuffle_nt,] %>% 
+  ggplot() +
+  geom_point(aes(x = UMAP_1, y = UMAP_2, color = time_point), size = 0.01) +
+  # scale_color_viridis_c(option = "D") +
+  scale_color_gradientn(colors = brewer.pal(9, "BuPu")) +
+  labs(color = "Time (days)") +
+  coord_fixed(ratio = 0.8) +
+  # guides(color = guide_legend(override.aes = list(size = 3))) +
+  theme(plot.title = element_text(size = 10, hjust = 0.5, face = "bold"),
+        axis.title = element_text(size = 8),
+        axis.text = element_blank(),
+        axis.ticks = element_blank(),
+        legend.text = element_text(size = 8),
+        legend.key.height = unit(0.1, "in"),
+        panel.background = element_blank())
+# legend1 <- get_plot_component(p1, 'guide-box-right', return_all = TRUE)
+
+p_nt_size <-
+  so_nT@meta.data[idx_shuffle_nt,] %>% 
+  ggplot() +
+  geom_point(aes(x = UMAP_1, y = UMAP_2, color = tumor_size), size = 0.01) +
+  scale_color_gradientn(colors = brewer.pal(9, "OrRd")) +
+  # scale_color_viridis_c(option = "B") +
+  labs(color = "Tumor size (mm2)") +
+  coord_fixed(ratio = 0.8) +
+  # guides(color = guide_legend(override.aes = list(size = 3))) +
+  theme(plot.title = element_text(size = 10, hjust = 0.5, face = "bold"),
+        axis.title = element_text(size = 8),
+        axis.text = element_blank(),
+        axis.ticks = element_blank(),
+        legend.text = element_text(size = 8),
+        legend.key.height = unit(0.1, "in"),
+        panel.background = element_blank())
+
+pdf(paste0("S1B_UMAP_by_time_size_nonT_", Sys.Date(), ".pdf"), width = 5, height = 3)
+p_nt_time
+p_nt_size
+dev.off()
+```
+
+## S1C. UMAP plots of genes and signatures.
+```{r}
+source("~/project/utils/map_genes/map_human_mouse_genes.R")
+cell_cycle_genes <- union(human_to_mouse(cc.genes.updated.2019$s.genes), human_to_mouse(cc.genes.updated.2019$g2m.genes))
+so_T <- AddModuleScore(so_T, features = list(cell_cycle_genes), name = "cell_cycle")
+colnames(so_T@meta.data) <- sub("cell_cycle1", "Cell cycle", colnames(so_T@meta.data))
+
+features_to_plot <- list(
+  "T" = c("Cd3e", "Klra7", "Cd8a", "Cd4", "Pdcd1", "Havcr2", "Foxp3", "Cell cycle"),
+  "nT" = c("Cd14", "Cd24a", "Cd209a", "Ccr7", "Cd19", "Ncr1", "Xcr1", "Bst2")
+)
+
+plist <- lapply(names(features_to_plot), function(x) {
+  if (x == "T") {so <- so_T} else {so <- so_nT}
+  lapply(features_to_plot[[x]], function(f) {
+    plt_df <- so@meta.data %>% select(UMAP_1, UMAP_2)
+    if (f %in% rownames(so)) {
+      plt_df$value <- as.numeric(so[["RNA"]]@data[f,])
+      lab_value <- "Expression"
+    } else {
+      plt_df$value <- so@meta.data[,f]
+      lab_value <- "Signature\nscore"
+    }
+    plt_df %>% 
+      arrange(value) %>% 
+      ggplot() +
+      geom_point(aes(x = UMAP_1, y = UMAP_2, color = value), size = 0.01) +
+      scale_color_gradientn(colors = brewer.pal(9, "Blues")[-1]) +
+      labs(color = lab_value, title = f) +
+      theme(plot.title = element_text(size = 10, hjust = 0.5, face = "italic"),
+          axis.title = element_text(size = 8),
+          axis.text = element_blank(),
+          axis.ticks = element_blank(),
+          legend.text = element_text(size = 8),
+          legend.title = element_text(size = 8),
+          legend.key.width = unit(0.1, "in"),
+          legend.key.height = unit(0.1, "in"),
+          panel.background = element_blank(),
+          panel.border = element_rect(color = "black", fill = NA))
+  })
+})
+
+pdf(paste0("S1C_UMAP_features_", Sys.Date(), ".pdf"), width = 6, height = 7)
+grid.arrange(grobs = plist[[1]], ncol = 2)
+grid.arrange(grobs = plist[[2]], ncol = 2)
+dev.off()
+```
+
+
+
+## S1D. violin plot compare cell cycle signature scores in T4, T7, T2 and T8.
+Plot selected pathways.
+```{r}
+clusters_to_plot <- c("T4", "T7", "T2", "T8")
+plt_df <- so_T@meta.data %>% 
+  filter(cluster_name %in% clusters_to_plot)
+p_cc <-
+  ggplot(plt_df, aes(x = cluster_annotation, y = `Cell cycle`)) +
+  geom_quasirandom(aes(color = cluster_annotation)) +
+  geom_boxplot(outliers = FALSE, fill = NA, color = "black", width = 0.1, size = 1) +
+  geom_signif(comparisons = list(c("T7. CD8+ PD1+ TIM3+ 2", "T4. CD8+ PD1+ TIM3+ 1"),
+                                 c("T2. CD4+ Treg 1", "T8. CD4+ Treg 2")), margin_top = 0.1) +
+  scale_color_manual(values = color_cluster_annotation_T) +
+  scale_y_continuous(expand = expansion(mult = c(0.05, 0.15))) +
+  theme_classic() +
+  labs(x = "", y = "Signature score", color = "", title = "Cell cycle") +
+  theme(axis.text.x = element_text(color = "black", angle = 45, hjust = 1),
+        plot.title = element_text(face = "bold", hjust = 0.5),
+        legend.position = "none")
+
+pdf(paste0("SD_violin_cell_cycle_score_", Sys.Date(), ".pdf"), width = 3.5, height = 4)
+p_cc
+dev.off()
+```
+
+
+
+## S1E. T5 vs. T6
+Plot selected pathways.
+```{r}
+plt_df <- read.xlsx("GSEA_T5_vs_T6_selected.xlsx", sheet = "to_plot") %>% 
+  filter(!grepl("^Non-Tfh", Name_in_plot)) %>% 
+  mutate(enriched_in = factor(enriched_in, levels = c("T_5", "T_6"), labels = c("T5. CD4+ Tconv 1", "T6. CD4+ Tconv 2")))
+plt_df$Name_in_plot <- factor(plt_df$Name_in_plot, levels = plt_df$Name_in_plot, labels = sub(" \\(", "\n\\(", plt_df$Name_in_plot))
+plt_df$pvalue_label <- paste0(" p=", formatC(plt_df$pvalue, digits = 2, format = "e"), " ")
+p <- ggplot(plt_df, aes(x = Name_in_plot, y = NES)) +
+  geom_bar(aes(fill = enriched_in), stat = "identity", color = "black", width = 0.7) +
+  geom_text(aes(label = pvalue_label, hjust = NES > 0), y = 0, size = 3) +
+  geom_hline(yintercept = 0, color = "black") +
+  geom_vline(xintercept = 0, color = "black") +
+  coord_flip() +
+  scale_fill_manual(values = color_cluster_annotation_T) +
+  theme_minimal() +
+  labs(y = "Normalized enrichment score", x = "", fill = "Enriched in") +
+  theme(axis.text = element_text(color = "black"))
+pdf(paste0("S1E_barplot_T5_vs_T6_enrichment_", Sys.Date(), ".pdf"), width = 7, height = 3.4)
+p
+dev.off()
+```
+
+
+## S1F. SS2 cell label prediction.
+```{r}
+meta_plate <- readRDS("../../timecourse_sc_RNAseq_smartseq2/meta_cd4_cd8_clonotype_2021-08-27.rds")
+plt_df <- meta_plate %>% 
+  mutate(annotation = factor(names(color_annotation_T)[match(paste0("T", meta_plate$predicted.id), names(color_cluster_T))], levels = names(color_annotation_T))) %>% 
+  group_by(orig.ident, annotation) %>% 
+  tally()
+
+p <- ggplot(plt_df, aes(x = annotation, y = n, fill = orig.ident)) +
+  geom_bar(stat = "identity", position = "dodge") +
+  scale_y_continuous(expand = c(0, 0)) +
+  scale_fill_manual(values = c("CD4" = alpha("red", 0.5), "CD8" = alpha("black", 0.5))) +
+  labs(x = "Predicted cell type", y = "Number of cells", fill = "FACS sort\ncell type") +
+  theme_classic() +
+  theme(axis.text.x = element_text(color = "black", angle = 45, hjust = 1))
+pdf(paste0("S1F_barplot_predicted_celltype_", Sys.Date(), ".pdf"), width = 5, height = 4)
+p
+dev.off()
+```
+
+
+
+
+

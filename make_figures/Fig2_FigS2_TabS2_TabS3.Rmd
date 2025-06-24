@@ -1,0 +1,417 @@
+---
+title: "Figure 2: Cluster-specific gene expression dynamics"
+output: html_notebook
+---
+
+
+```{r, echo=FALSE}
+## configuration
+rm(list = ls())
+
+library(tidyverse)
+library(RColorBrewer)
+library(ComplexHeatmap)
+library(circlize)
+library(Seurat)
+library(gridExtra)
+library(openxlsx)
+options(Seurat.object.assay.version = "v3") # objects were created with v3
+source("utils.R")
+```
+
+To evaluate cluster's tendency to change its expression program over time and size.
+
+
+load data
+```{r}
+so_T <- readRDS("../../data/scRNAseq_10x/seuratObject_T_cells.rds")
+so_nT <- readRDS("../../data/scRNAseq_10x/seuratObject_non_T_cells.rds")
+
+cluster_vec_all <- c(paste0("T", 0:9), paste0("Non-T", 0:11)) # all clusters except Non-T_12 (Unknown cell type)
+```
+
+## 2A. dot plot show cluster size change over time/size.
+```{r}
+cd8 <- readRDS("../../timecourse_sc_RNAseq_10x/2_CD8_focused/cd8.rds")
+
+is_cd4 <- (so_T$cluster_name %in% c("T3", ann_T$cluster[ann_T$contain_CD8 == "no"])) & (!(colnames(so_T) %in% colnames(cd8)))
+cd4 <- so_T[,is_cd4]
+cd4@meta.data <- droplevels(cd4@meta.data)
+
+table(so_T$annotation)
+table(cd8$annotation)
+table(cd4$annotation)
+```
+
+
+```{r}
+
+test_cell_frequency <- function(so) {
+  df <- so@meta.data %>%
+    # mutate(time_point = factor(time_point, levels = c("9", "11", "12", "13", "16"), ordered = TRUE)) %>%
+    group_by(mouse_id, time_point, tumor_size, cluster_name, annotation) %>%
+    tally(name = "n") %>%
+    group_by(mouse_id) %>%
+    mutate(total_n = sum(n), prop = n / total_n)
+  res_size <- sapply(levels(df$cluster_name), function(x) {
+    df_sub <- df %>% filter(cluster_name == x)
+    # m <- glm(n ~ tumor_size, family = poisson(), offset = log(total_n), data = df_sub)
+    m <- lm(prop ~ log(tumor_size), data = df_sub)
+    # plot(m)
+    summary(m)$coefficients[2,]
+  }) %>% t %>%
+    data.frame(check.names = FALSE) %>%
+    rownames_to_column("cluster_name") %>%
+    mutate(cov = "size")
+  res_time <- sapply(levels(df$cluster_name), function(x) {
+    df_sub <- df %>% filter(cluster_name == x)
+    # m <- glm(n ~ time_point, family = poisson(), offset = log(total_n), data = df_sub)
+    m <- lm(prop ~ (time_point), data = df_sub)
+    # plot(m)
+    summary(m)$coefficients[2,]
+  }) %>% t %>%
+    data.frame(check.names = FALSE) %>%
+    rownames_to_column("cluster_name") %>%
+    mutate(cov = "time")
+
+  rbind(res_size, res_time)
+}
+
+res_cd4 <- test_cell_frequency(cd4) %>% mutate(compartment = "CD4+ T")
+res_cd8 <- test_cell_frequency(cd8) %>% mutate(compartment = "CD8+ T")
+res_nT <- test_cell_frequency(so_nT) %>% mutate(compartment = "Non-T")
+
+plt_df <- Reduce(rbind, list(res_cd4, res_cd8, res_nT)) %>% 
+  mutate(nlog10p = -log10(`Pr(>|t|)`),
+         nlog10p_cap = pmin(nlog10p, quantile(nlog10p, 0.9, na.rm = T)),
+         direction = ifelse(`Pr(>|t|)` >= 0.05, "n.s.", 
+                            ifelse(Estimate > 0, "Increase", "Decrease")),
+         cov = factor(cov, levels = c("time", "size"), labels = c("Time", "Size")),
+         cluster_name = factor(cluster_name, levels = cluster_vec_all)) %>% 
+  filter(!is.na(cluster_name))
+
+p <- ggplot(plt_df, aes(x = cluster_name, y = cov, size = nlog10p_cap, fill = direction)) +
+  geom_point(shape = 21) +
+  facet_grid(~compartment, scale = "free", space = "free") +
+  scale_fill_manual(values = c("Increase" = "red", "Decrease" = "blue", "n.s." = "white")) +
+  labs(x = "", y = "", fill = "Direction", size = "-log10(p)") +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        strip.text = element_text(face = "bold"),
+        legend.position = "bottom")
+pdf(paste0("2A_dotplot_cluster_size_proportion_linear_", Sys.Date(), ".pdf"), width = 7, height = 2.5)
+p
+dev.off()
+```
+
+Load time/size DE results.
+```{r}
+df_time_size <- readRDS("../analysis/1_sc_RNAseq_10x/3_dynamic_gene_analysis/edgeR_time_size_all_2020-12-30.rds")
+```
+
+
+
+
+
+## 2B. Heatmap of p-values for genes change over time and size
+```{r}
+thresh_fdr <- 0.05
+
+plt_df <- df_time_size %>% 
+  mutate(Cluster = sub("_", "", Cluster)) %>% 
+  filter(Cluster %in% cluster_vec_all) %>% 
+  mutate(logFC = ifelse(FDR < thresh_fdr, logFC, NA), 
+         logFC_cap = pmax(pmin(logFC, 2), -2)) %>% 
+  group_by(Gene, cov) %>% 
+  mutate(any_de = any(FDR<thresh_fdr)) %>% 
+  ungroup() %>% 
+  filter(any_de) %>% 
+  mutate(Cluster = factor(Cluster, levels = (cluster_vec_all)))
+
+plt_mtx_time <- plt_df %>% filter(cov == "Time") %>% 
+  select(Gene, Cluster, logFC_cap) %>% 
+  spread(key = "Cluster", value = "logFC_cap", fill = 0) %>% 
+  column_to_rownames(var = "Gene") %>% t()
+plt_mtx_time <- plt_mtx_time[,do.call(order, data.frame(t(plt_mtx_time)))]
+
+plt_mtx_size <- plt_df %>% filter(cov == "Size") %>% 
+  select(Gene, Cluster, logFC_cap) %>% 
+  spread(key = "Cluster", value = "logFC_cap", fill = 0) %>% 
+  column_to_rownames(var = "Gene") %>% t()
+plt_mtx_size <- plt_mtx_size[,do.call(order, data.frame(t(plt_mtx_size)))]
+
+pdf(paste0("2B_heatmap_DEG_", Sys.Date(), ".pdf"), width = 14, height = 4)
+Heatmap(plt_mtx_time,
+        col = colorRamp2(breaks = c(-1, -0.5, 0, 0.5, 1), colors = c("#22578B", "#73A9D2", "white", "#FDB393", "#b22222")),
+        cluster_rows = F,
+        cluster_columns = F,
+        clustering_distance_columns = "correlation",
+        clustering_distance_rows = "correlation",
+        show_row_names = T,
+        show_column_names = F, 
+        column_title = "Time", 
+        name = "log2 fold change",
+       heatmap_width = unit(0.03, "cm")*ncol(plt_mtx_time),
+       border = TRUE)
+
+Heatmap(plt_mtx_size,
+        col = colorRamp2(breaks = c(-0.04, -0.02, 0, 0.02, 0.04), colors = c("#22578B", "#73A9D2", "white", "#FDB393", "#b22222")),
+        cluster_rows = F,
+        cluster_columns = F,
+        clustering_distance_columns = "correlation",
+        clustering_distance_rows = "correlation",
+        show_row_names = T,
+        show_column_names = F, 
+        column_title = "Size", 
+        name = "log2 fold change",
+       heatmap_width = unit(0.03, "cm")*ncol(plt_mtx_size),
+       border = TRUE)
+dev.off()
+```
+
+## 2C: Number of time/size varying genes
+Count and plot the number of total/unique time/size dependent genes in each cluster
+```{r}
+## total number of time/size dependent genes
+plt_df <- df_time_size %>% 
+  mutate(Cluster = sub("_", "", Cluster)) %>% 
+  filter(FDR < thresh_fdr) %>% 
+  group_by(Gene, cov) %>% 
+  mutate(unique = n() == 1) %>% 
+  ungroup() %>% 
+  mutate(direction = ifelse(logFC > 0, "Up", "Down")) %>% 
+  mutate(d_u = paste0(direction, ifelse(unique, ", unique", ", not unique"))) %>% 
+  mutate(Cluster = factor(Cluster, levels = (cluster_vec_all))) %>% 
+  mutate(cov = factor(cov, levels = c("Size", "Time")))
+p_bar <- plt_df %>% 
+  ggplot() +
+  geom_bar(aes(x = Cluster, fill = d_u)) +
+  scale_fill_manual(values = c("Up, unique" = "red", "Down, unique" = "blue", "Up, not unique" = "#ff8080", "Down, not unique" = "#8080ff")) +
+  labs(x = "", y = "Number of genes", title = "", fill = "DE direction") +
+  facet_wrap(~cov, nrow = 1) +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+p_bar
+pdf(paste0("2C_barplot_n_DEG_", Sys.Date(), ".pdf"), width = 12, height = 4)
+p_bar
+dev.off()
+```
+
+## 2D. Scatter plot number of size/time DE genes vs. number of cells in cluster.
+```{r}
+color_de_direction <- c("Up" = "red", "Down" = "blue")
+plt_df <- df_time_size %>%
+  mutate(Cluster = sub("_", "", Cluster)) %>% 
+  filter(FDR < thresh_fdr) %>% 
+  mutate(direction = ifelse(logFC > 0, "Up", "Down")) %>% 
+  group_by(Cluster, cov, direction) %>% 
+  tally(name = "n_gene") %>% 
+  mutate(n_cell = c(table(so_T$cluster_name), table(so_nT$cluster_name))[Cluster],
+         Cluster = factor(Cluster, levels = (cluster_vec_all)),
+         cov = factor(cov, levels = c("Size", "Time")),
+         direction = factor(direction, levels = c("Up", "Down")),
+         cluster_type = factor(grepl("^T", Cluster), levels = c("TRUE", "FALSE"), labels = c("T", "Non-T")))
+
+plt_df %>% 
+  group_by(cov, direction) %>% 
+  reframe(r = cor(n_gene, n_cell, method = "pearson"),
+          r_pval = cor.test(n_gene, n_cell, method = "pearson")$p.value)
+  
+p <- ggplot(plt_df, aes(x = n_cell, y = n_gene, color = direction, shape = cluster_type)) +
+  geom_point(size = 4) +
+  # geom_smooth(aes(group = direction), method = "lm") +
+  facet_grid(direction~cov) +
+  scale_color_manual(values = color_de_direction) +
+  scale_shape_manual(values = c("T" = 21, "Non-T" = 24)) +
+  labs(x = "Number of cells", y = "Number of DE genes", color = "DE direction", shape = "Cluster type") +
+  theme_bw()
+pdf(paste0("2D_scatter_number_of_deg_vs_cells_", Sys.Date(), ".pdf"), width = 6, height = 4)
+p
+dev.off()
+```
+
+## 2E. Dotplot of shared enriched pathways.
+
+Enrichment analysis for genes DE over time or size
+Dot plot to show the selected pathways in all clusters.
+
+```{r}
+# cluster_vec_all <- c(paste0("T_", 0:9), paste0("Non-T_", 0:11))
+## load enrichment results
+date_enrichment <- "2021-09-28"
+df_enrichment <- lapply(c("time", "size"), function(i) {
+  lapply(cluster_vec_all, function(x){
+    cluster_num <- unlist(strsplit(x, split = "T"))[2]
+    if (grepl("Non-T", x)) {
+      f_up <- paste0("enrichment_2021-09-28/", i, "_nT_Cluster_", cluster_num, "_up all_genes cheat sheet.csv")
+      f_down <- paste0("enrichment_2021-09-28/", i, "_nT_Cluster_", cluster_num, "_down all_genes cheat sheet.csv")
+    } else {
+      f_up <- paste0("enrichment_2021-09-28/", i, "_T_Cluster_", cluster_num, "_up all_genes cheat sheet.csv")
+      f_down <- paste0("enrichment_2021-09-28/", i, "_T_Cluster_", cluster_num, "_down all_genes cheat sheet.csv")
+    }
+    ## columns: term, ann_list_size, ann_in_background, frac_term_in_bkgd, odds_ratio, 
+    ##          sample_size, num_in_term, frac_in_term, p_val, website, 
+    ##          genes, fdr, set_list
+    
+    if (file.exists(f_up)) {
+      up_df <- read.table(file = f_up, sep = ",", header = T, as.is = T)
+    } else {
+      up_df <- data.frame()
+    }
+    if (file.exists(f_down)) {
+      down_df <- read.table(file = f_down, sep = ",", header = T, as.is = T)
+    } else {
+      down_df <- data.frame()
+    }
+    res_df <- rbind(up_df, down_df)
+    if (nrow(res_df) == 0) {
+      return(NULL)
+    }
+    res_df$cluster <- x
+    res_df$de_direction <- factor(c(rep("Up", nrow(up_df)), rep("Down", nrow(down_df))), levels = c("Up", "Down"))
+    res_df$covariate <- i
+    return(res_df)
+  }) %>% Reduce(rbind, .)
+}) %>% Reduce(rbind, .)
+
+write.xlsx(df_enrichment, paste0("all_enrichment_combined_", Sys.Date(), ".xlsx"))
+
+selected_terms <- read.xlsx("Selected enrichments for new Fig 2.xlsx", sheet = "updated_parsed") %>% unique()
+stopifnot(length(setdiff(selected_terms$term, df_enrichment$term)) == 0)
+
+plt_df <- merge(df_enrichment, selected_terms, by = "term", all.y = TRUE) %>% 
+  mutate(cluster = factor(cluster, levels = cluster_vec_all)) %>% 
+  filter(p_val < 0.05) %>% 
+  group_by(name_in_plot, cluster, covariate, .drop = FALSE) %>% 
+  mutate(direction_both = length(unique(de_direction)) == 2) %>% 
+  ungroup() %>% 
+  filter(!direction_both) %>% 
+  mutate(covariate = factor(covariate, levels = c("size", "time"), labels = c("Size", "Time")))
+  
+
+p_shared <- plt_df %>% 
+  filter(type == "shared") %>%
+  # group_by(name_in_plot) %>% 
+  # mutate(n_cluster = n(),
+  #        n_up = sum(de_direction == "Up")) %>% 
+  # arrange(n_up, n_cluster) %>% 
+  # mutate(name_in_plot = factor(name_in_plot, levels = unique(name_in_plot))) %>%
+  mutate(name_in_plot = factor(name_in_plot, levels = unique(selected_terms$name_in_plot))) %>% 
+  ggplot(aes(x = cluster, y = name_in_plot, size = -log10(p_val), fill = de_direction)) +
+  geom_point(shape = 21, alpha = 0.5) +
+  # coord_fixed(ratio = 1.5) +
+  facet_wrap(~covariate, nrow = 1) +
+  scale_x_discrete(drop=FALSE) +
+  scale_fill_manual(values = c("Up" = "red", "Down" = "blue")) +
+  scale_size(range = c(1, 6)) +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1, color = "black"),
+        axis.text.y = element_text(color = "black", size = 12),
+        legend.position = "bottom",
+        strip.text = element_text(color = "black", size = 12)) +
+  labs(x = "", y = "", fill = "Enriched direction")
+pdf(paste0("2E_dotplot_enrichment_shared_", Sys.Date(), ".pdf"), width = 11, height = 7)
+p_shared
+dev.off()
+```
+
+
+
+## Table S3. Enrichment results
+
+```{r}
+df_unique <- df_enrichment %>% 
+  filter(p_val < 0.05) %>% 
+  # filter(fdr < 0.1) %>% 
+  group_by(covariate, term, set_list, cluster) %>% 
+  mutate(both_direction = length(unique(de_direction)) == 2) %>% 
+  filter(!both_direction) %>% 
+  group_by(covariate, de_direction, term, set_list) %>% 
+  summarise(which_clusters = paste(sort(cluster), collapse = "."),
+            n_cluster = n(),
+            n_cluster_T = sum(grepl("^T", cluster) ),
+            n_cluster_nonT = sum(grepl("^N", cluster) )) %>% 
+  arrange(n_cluster_T, n_cluster_nonT, n_cluster)
+# write.xlsx(tmp, colNames = TRUE, "term_uniqueness.xlsx")
+plt_df <- df_unique %>%
+  filter(n_cluster == 1, set_list %in% c("GoTerms", "Hallmark", "KeggReactome")) %>%
+  group_by(which_clusters, de_direction, covariate) %>% 
+  summarise(n_terms = n()) %>% 
+  mutate(n_terms_polarized = n_terms * ((de_direction == "Up") - (de_direction == "Down"))) %>% 
+  mutate(which_clusters = factor(which_clusters, levels = cluster_vec_all)) %>% 
+  mutate(covariate = factor(covariate, levels = c("size", "time"), labels = c("Size", "Time")))
+  
+
+
+df_enrichment_sub <- df_enrichment %>% 
+  filter(p_val < 0.05) %>% 
+  # filter(fdr < 0.1) %>% 
+  group_by(covariate, term, set_list, cluster) %>% 
+  mutate(both_direction = length(unique(de_direction)) == 2) %>% 
+  filter(!both_direction) %>% 
+  mutate(is_unique = term %in% df_unique$term[df_unique$n_cluster == 1]) %>% 
+  select(-fdr, -both_direction)
+write.xlsx(df_enrichment_sub, paste0("TableS3_dynamic_pathway_enrichment_", Sys.Date(), ".xlsx"), overwrite = TRUE)
+```
+
+
+## S2A-B. Scatter plot cell proportion vs. size or time.
+```{r}
+compartment_vec <- c("CD4+ T", "CD8+ T", "Non-T")
+plt_df <- rbind(
+  cd4@meta.data %>% select(time = time_point, size = tumor_size, cluster = cluster_name, annotation, mouse_id) %>% mutate(compartment = "CD4+ T"),
+  cd8@meta.data %>% select(time = time_point, size = tumor_size, cluster = cluster_name, annotation, mouse_id) %>% mutate(compartment = "CD8+ T"),
+  so_nT@meta.data %>% select(time = time_point, size = tumor_size, cluster = cluster_name, annotation, mouse_id) %>% mutate(compartment = "Non-T")
+) %>%
+  mutate(cluster = factor(cluster, levels = (cluster_vec_all))) %>%
+  filter(!is.na(cluster)) %>%
+  group_by(cluster, annotation, mouse_id, time, size, compartment) %>%
+  tally(name = "n_cell") %>%
+  group_by(mouse_id, compartment) %>%
+  mutate(n_total = sum(n_cell),
+         pct_cell = n_cell / n_total * 100)
+
+# summary(plt_df)
+
+p_size <-lapply(compartment_vec, function(x) {
+  plt_df_sub <- plt_df %>% 
+    filter(compartment == x) %>% 
+    droplevels()
+  # nrow <- ceiling(nlevels(plt_df_sub) / 4)
+  ggplot(plt_df_sub, aes(x = size, y = pct_cell)) +
+    geom_point() +
+    geom_smooth(method = "lm") +
+    facet_wrap(~cluster, scales = "free", ncol = 6) +
+    # scale_x_log10(limits = c(20, 300)) +
+    scale_y_continuous(limits = c(0, 70)) +
+    labs(x = "Size", y = "Percent of cells") +
+    theme_classic()
+})
+
+p_time <-lapply(compartment_vec, function(x) {
+  plt_df_sub <- plt_df %>% 
+    filter(compartment == x) %>% 
+    droplevels()
+  # nrow <- ceiling(nlevels(plt_df_sub) / 4)
+  ggplot(plt_df_sub, aes(x = time, y = pct_cell)) +
+    geom_point() +
+    geom_smooth(method = "lm") +
+    facet_wrap(~cluster, scales = "free", ncol = 6) +
+    scale_x_log10(limits = c(1, 300)) +
+    scale_y_continuous(limits = c(0, 70)) +
+    labs(x = "Time", y = "Percent of cells") +
+    theme_classic()
+})
+  
+library(cowplot)
+
+pdf(paste0("S2A_scatter_cell_proportion_vs_size_", Sys.Date(), ".pdf"), width = 6, height = 6)
+plot_grid(plotlist = p_size, align = "hv", ncol = 1, rel_heights = c(1, 1, 1.8))
+dev.off()
+
+pdf(paste0("S2B_scatter_cell_proportion_vs_time_", Sys.Date(), ".pdf"), width = 6, height = 6)
+plot_grid(plotlist = p_time, align = "v", ncol = 1, rel_heights = c(1, 1, 1.8))
+dev.off()
+```
+
+

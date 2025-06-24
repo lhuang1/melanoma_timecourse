@@ -1,0 +1,264 @@
+---
+title: "Plate data analysis (with TCR)"
+output: html_notebook
+---
+
+```{r}
+rm(list = setdiff(ls(), c("so_T", "so_nT")))
+today <- Sys.Date()#"2020-10-14"
+dir_proj <- "/singerlab/linglin/b16/"
+dir_out <- paste0(dir_proj, "2_pipeline/plate/")
+if (!dir.exists(dir_out)) dir.create(dir_out, recursive = T)
+library(dplyr)
+library(tidyr)
+library(tibble)
+library(Seurat)
+library(Matrix)
+library(openxlsx)
+library(ggplot2)
+library(ggbeeswarm)
+library(RColorBrewer)
+library(pheatmap)
+library(gridExtra)
+source(paste0(dir_proj, "1_code/make_figures/utils.R"))
+
+# so_plate <- readRDS("../../2_pipeline/plate/so_cd4_cd8_2021-08-26.rds")
+so_plate <- readRDS("../../2_pipeline/plate/so_cd4_cd8_2021-07-22.rds")
+ann_T <- read.xlsx("/singerlab/linglin/b16/0_data/cluster_markers_20210826.xlsx", sheet = "T_annotation", colNames = T)
+so_plate$annotation <- ann_T$annotation[match(so_plate$predicted.id, sub("T_", "", ann_T$cluster))]
+
+so_plate <- RunUMAP(so_plate, reduction = "pca", dims = 1:20)
+saveRDS(so_plate@reductions, file = paste0(dir_out, "reductions_cd4_cd8_", today, ".rds"))
+so_cd4 <- so_plate[,so_plate$orig.ident == "CD4"]
+so_cd4 <- RunUMAP(so_cd4, reduction = "pca", dims = 1:20)
+saveRDS(so_cd4@reductions, file = paste0(dir_out, "reductions_cd4_", today, ".rds"))
+so_cd8 <- so_plate[,so_plate$orig.ident == "CD8"]
+so_cd8 <- RunUMAP(so_cd8, reduction = "pca", dims = 1:20)
+saveRDS(so_cd8@reductions, file = paste0(dir_out, "reductions_cd8_", today, ".rds"))
+
+so_plate$ident_ann <- "CD8"
+so_plate$ident_ann[so_plate$annotation %in% c("CD4 T conv 1", "CD4 T conv 2", "Treg", "Treg prolif")] <- "CD4"
+so_plate$ident_ann[so_plate$annotation == "Naïve T"] <- "Naïve"
+```
+
+
+Visualize on UMAP.
+```{r}
+pdf(paste0(dir_out, "umap_annotation_", today, ".pdf"), width = 9)
+DimPlot(so_plate, group.by = "orig.ident")
+DimPlot(so_plate, group.by = "annotation")
+DimPlot(so_cd4, group.by = "annotation")
+DimPlot(so_cd8, group.by = "annotation")
+dev.off()
+```
+
+Import and integrate TCR data.
+```{r}
+tcr_raw <- rbind(
+  read.table("../../0_data/plate/cell_tcr_features_ALL.txt", header = T, stringsAsFactors = F),
+  read.table("../../0_data/plate/cell_tcr_features_20171103.txt", header = T, stringsAsFactors = F)
+)
+
+## parse cell names
+#"HWH2FBGXX_S194" "HWH2FBGXX_S197" "HWH2FBGXX_S49" are only in one-underscore data; all other data are the same
+# AH3VMFBGXY  H3332BGXY  H57VWBGXY  HYGHVBGXX  are not in expression data....
+tcr_raw$cell_parsed <- strsplit(tcr_raw$cell, split = "_") %>% sapply(., function(x){
+  if (length(x) == 2) return(paste0(x[1], "_", x[2]))
+  if (x[1] == "HWH2FBGXX") return(NA)
+  return(paste0(x[1], "_", x[3]))
+})
+
+tcr_df <- tcr_raw %>% 
+  filter(func == 1) %>% 
+  filter(!is.na(cell_parsed)) %>% 
+  mutate(annotation = so_plate$annotation[match(cell_parsed, colnames(so_plate))],
+         orig.ident = so_plate$orig.ident[match(cell_parsed, colnames(so_plate))]) %>% 
+  filter(!is.na(annotation)) %>% 
+  group_by(cell_parsed, annotation, orig.ident) %>% 
+  summarise(n_A = length(grep("A_", chain)), 
+            n_B = length(grep("B_", chain)), 
+            id_combined = paste(sort(id), collapse = "_")) %>% 
+  ungroup() %>% 
+  filter(n_A > 0, n_B > 0) %>% 
+  group_by(id_combined) %>% 
+  add_tally(name = "clone_size") %>% 
+  ungroup() %>% 
+  group_by(id_combined, annotation) %>% 
+  add_tally(name = "clone_size_ann") %>% 
+  ungroup() %>% 
+  group_by(id_combined, orig.ident) %>% 
+  add_tally(name = "clone_size_ident") %>% 
+  ungroup() %>%
+  arrange(-clone_size)
+
+idx <- match(colnames(so_plate), tcr_df$cell_parsed)
+so_plate$tcr_id <- tcr_df$id_combined[idx]
+so_plate$clone_size <- tcr_df$clone_size[idx]
+so_plate$clone_size_ann <- tcr_df$clone_size_ann[idx]
+so_plate$clone_size_ident <- tcr_df$clone_size_ident[idx]
+recomb_id_vec <- unique(tcr_df$id_combined)
+clone_id_vec <- paste0("c_", seq_along(recomb_id_vec))
+so_plate$clonotype_id <- clone_id_vec[match(so_plate$tcr_id, recomb_id_vec)]
+(table(sub("_.*", "", colnames(so_plate)), is.na(so_plate$tcr_id)) / as.numeric(table(sub("_.*", "", colnames(so_plate))))) %>% round(., 2)
+(table(so_plate$annotation, is.na(so_plate$tcr_id)) / as.numeric(table(so_plate$annotation))) %>% round(., 2)
+
+saveRDS(so_plate@meta.data, file = paste0(dir_out, "meta_cd4_cd8_clonotype_", today, ".rds"))
+```
+
+
+Clone sizes overall
+```{r}
+pdf(paste0(dir_out, "clone_sizes_", today, ".pdf"), width = 7)
+size_df <- so_plate@meta.data %>% 
+  filter(!is.na(tcr_id)) %>% 
+  group_by(clonotype_id) %>% 
+  tally()
+table(size_df$n == 1)
+table(size_df$n[size_df$n > 1])
+ggplot(size_df) +
+  geom_histogram(aes(x = n), color = "black") +
+  labs(x = "clonotype size") +
+  scale_y_log10() +
+  theme_classic()
+
+size_df_2 <- so_plate@meta.data %>% 
+  filter(!is.na(tcr_id)) %>% 
+  group_by(clonotype_id, orig.ident) %>% 
+  tally()
+table(size_df_2$orig.ident, size_df_2$n == 1)
+table(size_df_2$orig.ident[size_df_2$n > 1], size_df_2$n[size_df_2$n > 1])
+ggplot(size_df_2) +
+  geom_histogram(aes(x = n, fill = orig.ident), color = "black") +
+  labs(x = "clonotype size") +
+  facet_wrap(~orig.ident) +
+  scale_y_log10() +
+  theme_classic()
+
+so_plate$log2_clone_size <- log2(so_plate$clone_size)
+FeaturePlot(so_plate, features = "log2_clone_size") +
+  scale_color_viridis_c(option = "B", na.value = "grey90")
+so_cd4$log2_clone_size <- log2(so_plate@meta.data[colnames(so_cd4), "clone_size_ident"])
+FeaturePlot(so_cd4, features = "log2_clone_size") +
+  scale_color_viridis_c(option = "B", na.value = "grey90")
+so_cd8$log2_clone_size <- log2(so_plate@meta.data[colnames(so_cd8), "clone_size_ident"])
+FeaturePlot(so_cd8, features = "log2_clone_size") +
+  scale_color_viridis_c(option = "B", na.value = "grey90")
+
+size_annot_df <- so_plate@meta.data %>% 
+  filter(!duplicated(tcr_id, annotation) & !is.na(tcr_id)) %>% 
+  arrange(-clone_size_ann)
+ggplot(size_annot_df, aes(x = annotation, y = clone_size_ann)) +
+  geom_quasirandom(color = "black") +
+  theme_classic() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+dev.off()
+```
+
+Check expanded clones.
+```{r}
+meta_sub <- so_plate@meta.data %>% 
+  filter(!is.na(clonotype_id), clone_size >= 3) %>% 
+  arrange(-clone_size)
+tab <- table(meta_sub$clonotype_id, meta_sub$annotation) 
+pct <- (tab/rowSums(tab)*100) %>% as.data.frame() %>% spread(key = Var2, value = Freq) %>% column_to_rownames(var = "Var1")
+
+p1 <- pheatmap(data.frame(`Total___________________` = rowSums(tab)), show_rownames = F, cluster_cols = F, cluster_rows = F,
+         color = colorRampPalette(c("grey90", "black"))(40), main = "number of cells")
+p2 <- pheatmap(pct[do.call(order, -cbind(pct, rowSums(pct>0))),], show_rownames = F, cluster_cols = F, cluster_rows = F,
+         color = colorRampPalette(c("white", "red"))(40), main = "percent of cells")
+
+pdf(paste0(dir_out, "heatmap_share_by_clusters_", today, ".pdf"), width = 5)
+# grid.arrange(p2$gtable)
+grid.arrange(p2$gtable, p1$gtable, nrow = 1, widths = c(6, 1))
+dev.off()
+
+tab <- table(meta_sub$clonotype_id, meta_sub$orig.ident)
+tab[rowSums(tab > 0) >= 2, ]
+
+## shared by CD4 & CD8
+tab <- table(meta_sub$clonotype_id, meta_sub$ident_ann)
+tab[rowSums(tab > 0) >= 2, ]
+expa_clone_vec <- rownames(tab)[rowSums(tab > 0) >= 2]
+plist <- lapply(expa_clone_vec, function(i){
+  plt_df <- data.frame(
+    in_clone = factor(ifelse(is.na(so_plate$clonotype_id), "NA", so_plate$clonotype_id == i), levels = rev(c("TRUE", "FALSE", "NA"))),
+    UMAP_1 = so_plate@reductions$umap@cell.embeddings[,"UMAP_1"],
+    UMAP_2 = so_plate@reductions$umap@cell.embeddings[,"UMAP_2"]
+  ) %>% arrange(in_clone)
+  ggplot(plt_df, aes(x = UMAP_1, y = UMAP_2, color = in_clone, size = in_clone)) +
+    geom_point() +
+    scale_color_manual(values = c("TRUE" = "red", "FALSE" = "black", "NA" = "grey90")) +
+    scale_size_manual(values = c("TRUE" = 1, "FALSE" = 0.1, "NA" = 0.1)) +
+    labs(caption = paste0("size = ", sum(tab[i,]), ", CD4: ", tab[i,"CD4"], ", CD8: ", tab[i,"CD8"])) +
+    theme_classic()
+})
+pdf(paste0(dir_out, "umap_clone_3_cd4_cd8_", today, ".pdf"), width = 8, height = 6)
+grid.arrange(grobs = plist, nrow = 2, ncol = 2)
+dev.off()
+
+
+## CD4
+expa_clone_vec_cd4 <- meta_sub %>% 
+  filter(orig.ident == "CD4") %>% select(clonotype_id) %>% unlist() %>% as.character() %>% 
+  setdiff(expa_clone_vec)
+so_cd4$clonotype_id <- so_plate@meta.data[colnames(so_cd4), "clonotype_id"]
+plist <- lapply(expa_clone_vec_cd4, function(i){
+  plt_df <- data.frame(
+    in_clone = factor(ifelse(is.na(so_cd4$clonotype_id), "NA", so_cd4$clonotype_id == i), levels = rev(c("TRUE", "FALSE", "NA"))),
+    UMAP_1 = so_cd4@reductions$umap@cell.embeddings[,"UMAP_1"],
+    UMAP_2 = so_cd4@reductions$umap@cell.embeddings[,"UMAP_2"]
+  ) %>% arrange(in_clone)
+  ggplot(plt_df, aes(x = UMAP_1, y = UMAP_2, color = in_clone, size = in_clone)) +
+    geom_point() +
+    scale_color_manual(values = c("TRUE" = "red", "FALSE" = "black", "NA" = "grey90")) +
+    scale_size_manual(values = c("TRUE" = 1, "FALSE" = 0.1, "NA" = 0.1)) +
+    labs(caption = paste0("size = ", sum(plt_df$in_clone=="TRUE"))) +
+    theme_classic()
+})
+pdf(paste0(dir_out, "umap_clone_3_cd4_", today, ".pdf"), width = 12, height = 6)
+grid.arrange(grobs = plist, nrow = 2, ncol = 3)
+dev.off()
+
+
+
+
+
+## CD8
+expa_clone_vec_cd8 <- meta_sub %>% 
+  filter(orig.ident == "CD8") %>% select(clonotype_id) %>% unlist() %>% as.character() %>% 
+  setdiff(expa_clone_vec)
+so_cd8$clonotype_id <- so_plate@meta.data[colnames(so_cd8), "clonotype_id"]
+plist <- lapply(expa_clone_vec_cd8, function(i){
+  plt_df <- data.frame(
+    in_clone = factor(ifelse(is.na(so_cd8$clonotype_id), "NA", so_cd8$clonotype_id == i), levels = rev(c("TRUE", "FALSE", "NA"))),
+    UMAP_1 = so_cd8@reductions$umap@cell.embeddings[,"UMAP_1"],
+    UMAP_2 = so_cd8@reductions$umap@cell.embeddings[,"UMAP_2"]
+  ) %>% arrange(in_clone)
+  ggplot(plt_df, aes(x = UMAP_1, y = UMAP_2, color = in_clone, size = in_clone)) +
+    geom_point() +
+    scale_color_manual(values = c("TRUE" = "red", "FALSE" = "black", "NA" = "grey90")) +
+    scale_size_manual(values = c("TRUE" = 1, "FALSE" = 0.1, "NA" = 0.1)) +
+    labs(caption = paste0("size = ", sum(plt_df$in_clone=="TRUE"))) +
+    theme_classic()
+})
+pdf(paste0(dir_out, "umap_clone_3_cd8_", today, ".pdf"), width = 12, height = 9)
+idx <- seq(1, length(plist), 9)
+for (i in seq_along(idx)) {
+  if (i < length(idx)) {
+    grid.arrange(grobs = plist[idx[i]:(idx[i+1]-1)], nrow = 3, ncol = 3)
+  } else {
+    grid.arrange(grobs = plist[idx[i]:length(plist)], nrow = 3, ncol = 3)
+  }
+}
+dev.off()
+```
+
+
+Check Penk
+```{r}
+pdf(paste0(dir_out, "umap_penk_cd8_", today, ".pdf"), width = 12, height = 6)
+FeaturePlot(so_cd8, features = c("Penk", "Havcr2", "Pdcd1", "Foxp3", "Il2ra", "Il7r"), ncol = 3, pt.size = 0.5, sort.cell = T)
+dev.off()
+```
+

@@ -1,0 +1,175 @@
+---
+title: "B16 pathway analysis"
+author: "Kathleen Newcomer; Modified by Linglin Huang"
+date: "2020-12-30"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+dir_proj <- "/singerlab/linglin/b16/"
+source(file = paste0(dir_proj, "1_code/TSA/modified_Kathleen pathway analysis functions.R"))
+
+results <- paste0(dir_proj, "2_pipeline/TSA/enrichment_", Sys.Date(), "/")
+dir.create(results)
+
+cheat_sheet_q_val <- 0.5
+
+de_thresh_fdr <- 0.1
+
+
+# input_folder <- "/singerlab/linglin/b16/0_data/gene_lists/All lit sigs/"
+# output_file <- "/singerlab/linglin/b16/0_data/gene_lists/GMT/literature.symbols.updated.gmt"
+# make_gmt(input_folder, output_file)
+gene_sets <- list( "KeggReactome" = "c2.kegg.reactome.v7.0.symbols.gmt",
+                         #  "BiocartaPid" = "c2.pid.biocarta.v7.0.symbols.gmt",
+                          # "Perturbations" = "c2.cgp.v7.0.symbols.gmt",
+                           "GoTerms" = "c5.all.v7.0.symbols.gmt",
+                           "c7Immune" = "c7.all.v7.0.symbols.gmt",
+                           "Literature" = "literature.symbols.updated.gmt",
+                           "Hallmark" = "h.all.v7.0.symbols.gmt"
+)
+```
+
+DE genes
+```{r}
+date_de <- "2020-12-30"
+res_time_T <- readRDS(paste0(dir_proj, "2_pipeline/TSA/DE_time_size/edgeR_time_T_", date_de, ".rds"))
+res_time_nT <- readRDS(paste0(dir_proj, "2_pipeline/TSA/DE_time_size/edgeR_time_T_", date_de, ".rds"))
+res_size_T <- readRDS(paste0(dir_proj, "2_pipeline/TSA/DE_time_size/edgeR_size_T_", date_de, ".rds"))
+res_size_nT <- readRDS(paste0(dir_proj, "2_pipeline/TSA/DE_time_size/edgeR_size_nT_", date_de, ".rds"))
+bg_thresh_fdr <- 0.05
+deg_time_T <- lapply(res_time_T, function(x) {rownames(x)[x$FDR < bg_thresh_fdr]})
+deg_time_nT <- lapply(res_time_nT, function(x) {rownames(x)[x$FDR < bg_thresh_fdr]})
+deg_size_T <- lapply(res_size_T, function(x) {rownames(x)[x$FDR < bg_thresh_fdr]})
+deg_size_nT <- lapply(res_size_nT, function(x) {rownames(x)[x$FDR < bg_thresh_fdr]})
+
+date_de <- "2020-08-06"
+res_cluster_T <- readRDS(paste0(dir_proj, "2_pipeline/old/diff_expr/cluster_", date_de, "/res_wilcoxon_T.rds"))
+res_cluster_nT <- readRDS(paste0(dir_proj, "2_pipeline/old/diff_expr/cluster_", date_de, "/res_wilcoxon_nT.rds"))
+bg_thresh_fdr <- 0.05
+bg_thresh_lfc <- 0.25
+deg_cluster_T <- res_cluster_T$gene[res_cluster_T$p_val_adj < bg_thresh_fdr & abs(res_cluster_T$avg_logFC) > bg_thresh_lfc]
+deg_cluster_nT <- res_cluster_nT$gene[res_cluster_nT$p_val_adj < bg_thresh_fdr & abs(res_cluster_nT$avg_logFC) > bg_thresh_lfc]
+```
+
+```{r}
+sapply(res_time_T, function(x){x["Tcf7",]})
+sapply(res_size_T, function(x){x["Tcf7",]})
+```
+
+
+limited background
+```{r}
+# limited_background_T <- Reduce(union, c(deg_time_T, deg_size_T, list(deg_cluster_T)))
+# limited_background_nT <- Reduce(union, c(deg_time_nT, deg_size_nT, list(deg_cluster_nT)))
+so_T <- readRDS(paste0(dir_proj, "2_pipeline/prep_data/so_T_2020-08-06.rds"))
+so_nT <- readRDS(paste0(dir_proj, "2_pipeline/prep_data/so_nT_2020-08-06.rds"))
+all_detected_genes_T <- rownames(so_T)[Matrix::rowSums(so_T[["RNA"]]@counts) > 0]
+all_detected_genes_nT <- rownames(so_nT)[Matrix::rowSums(so_nT[["RNA"]]@counts) > 0]
+# rm(so_T, so_nT)
+```
+
+```{r}
+cell_type_vec <- c("T", "nT")
+covariate_vec <- c("time", "size")
+
+for (covariate in covariate_vec) {
+  for (cell_type in cell_type_vec) {
+    if (covariate == "time" & cell_type == "T") {
+      res <- res_time_T
+      all_genes <- all_detected_genes_T
+    } else if (covariate == "time" & cell_type == "nT") {
+      res <- res_time_nT
+      all_genes <- all_detected_genes_nT
+    } else if (covariate == "size" & cell_type == "T") {
+      res <- res_size_T
+      all_genes <- all_detected_genes_T
+    } else if (covariate == "size" & cell_type == "nT") {
+      res <- res_size_nT
+      all_genes <- all_detected_genes_nT
+    }
+    
+    for (i in setdiff(names(res), c("Cluster_0", "Cluster_1", "Cluster_2"))) {
+    # for (i in c("Cluster_0", "Cluster_1", "Cluster_2")) {
+      cat(covariate, cell_type, i, "\n")
+      up_de <- rownames(res[[i]][res[[i]]$FDR < de_thresh_fdr & res[[i]]$logFC > 0,])
+      down_de <- rownames(res[[i]][res[[i]]$FDR < de_thresh_fdr & res[[i]]$logFC < 0,])
+      
+      standard_pathway_analysis(de_genes = up_de, 
+                                de_genes_name = paste(covariate, cell_type, i, "up", sep = "_"), 
+                                background = all_genes, 
+                                background_name = "all_genes", 
+                                dir_results = results,
+                                set_lists = gene_sets)
+      standard_pathway_analysis(de_genes = down_de, 
+                                de_genes_name = paste(covariate, cell_type, i, "down", sep = "_"), 
+                                background = all_genes,
+                                background_name = "all_genes", 
+                                dir_results = results,
+                                set_lists = gene_sets)
+    }
+    
+  }
+}
+```
+
+Cluster markers
+```{r}
+results <- paste0(dir_proj, "2_pipeline/cluster_characterization/enrichment_", Sys.Date(), "/")
+dir.create(results)
+
+cluster_thresh_fdr <- 0.05
+cluster_thresh_lfc <- 0.25
+cell_type_vec <- c("T", "nT")
+for (cell_type in cell_type_vec) {
+  if (cell_type == "T") {
+    res_cluster <- res_cluster_T
+    limited_background <- limited_background_T
+  } else {
+    res_cluster <- res_cluster_nT
+    limited_background <- limited_background_nT
+  }
+  cluster_vec <- unique(res_cluster$cluster) %>% sort()
+  for (i in cluster_vec) {
+    cat(cell_type, i, "\t")
+    markers <- res_cluster %>% filter(p_val_adj < cluster_thresh_fdr & avg_logFC > cluster_thresh_lfc & cluster == i) %>% 
+      dplyr::select(gene) %>% unlist() %>% as.character()
+    standard_pathway_analysis(de_genes = markers, 
+                                de_genes_name = paste(cell_type, i, sep = "_"), 
+                                background = limited_background, 
+                                background_name = "all_detected_genes", 
+                                dir_results = results,
+                                set_lists = gene_sets)
+  }
+}
+
+```
+
+
+```{r}
+
+
+
+# cluster_TSA_markers <- list.files(path = "b16_conor/kathleen_Gene_TSA_results/to run pathway analysis", full.names = TRUE)
+# all_genes <- read.table("~/Documents/function scripts/Master(all) Mouse to Human.txt", header = TRUE, stringsAsFactors = FALSE)$Human
+# 
+# 
+# for (file in cluster_TSA_markers) {
+#   table <- read.table(file = file, header = TRUE, stringsAsFactors = FALSE, row.names = 1)
+#   
+#   up_de <- rownames(table[table$logFC > 0,])
+#   down_de <- rownames(table[table$logFC < 0,])
+#   
+#   standard_pathway_analysis(de_genes = up_de, de_genes_name = paste0(basename(file), " up"), background = all_genes, background_name = "all genes background", set_lists = gene_sets)
+#   standard_pathway_analysis(de_genes = down_de, de_genes_name = paste0(basename(file), " down"), background = all_genes, background_name = "all genes background", set_lists = gene_sets)
+# }
+
+
+
+```
+
+
+
+
